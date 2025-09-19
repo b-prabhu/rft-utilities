@@ -1,0 +1,1073 @@
+/**
+ * Resource Forecast Tool — Office Script for Excel on the Web
+ * Type-safe, no generators, explicit types, arrow-callbacks only.
+ * Updated: 2025-09-19
+ * - 0.5h quantum enforced in assignHours and distribution
+ * - Monthly "seed" pass ensures each qualifying project gets some hours each month
+ */
+
+/////////////////////// Types & Utilities ///////////////////////
+
+interface Dict<T> { [key: string]: T }
+
+type StatusType = "Active" | "Inactive";
+type DistMethod = "Standard" | "Recurring Monthly";
+type AssignType = "Primary-ShareProportion" | "Exclusive-ShareOne" | "Exclusive-DoNotShare";
+
+type Cell = string | number | boolean | null;
+type Row = Cell[];
+
+type Config = {
+  dailyHours: number | null;
+  forecastStart: Date | null;
+  forecastEnd: Date | null;
+  minMonthlyShare?: number; // per project per month
+  minWeeklyShare?: number;  // per project per ISO week
+  eolWindowDays?: number;
+  eolMaxBoost?: number;
+};
+
+type ProjectRow = {
+  key: string; id: string; name: string; pm: string; desc: string;
+  total: number; prevUsed: number; remaining: number;
+  start: Date; end: Date; status: StatusType;
+  distMethod: DistMethod; primaryId: string; primaryName: string; assignType: AssignType;
+};
+
+type ResourceRow = {
+  id: string; name: string; role: string; start: Date; end: Date; status: StatusType;
+};
+
+type ResAlloc = { ResourceId: string; ResourceName: string; ProjectKey: string; ProjectId: string; ProjectName: string; Date: string; Hours: number; Notes: string; };
+type ProAlloc = { ProjectKey: string; ProjectId: string; ProjectName: string; ProjectManager: string; Date: string; Hours: number; Notes: string; };
+
+/** Project remaining pools */
+type ProjectRemaining = { totalRemaining: number; monthlyRemaining: Dict<number> };
+
+/** Candidate project for daily allocation */
+type Cand = { p: ProjectRow; left: number; prioKey: [number, number, number, number] };
+
+let resourcesById: Dict<ResourceRow> = {};
+
+const QUANTUM: number = 0.5; // all allocations in 0.5h increments
+const EPS: number = 1e-6;
+
+function dateOnly(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+function quantizeDown(x: number): number {
+  const q: number = Math.floor(x / QUANTUM) * QUANTUM;
+  return q >= QUANTUM ? q : 0;
+}
+
+function asDate(v: unknown): Date | null {
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : dateOnly(v);
+  if (typeof v === "number" && isFinite(v)) {
+    const d: Date = new Date(1899, 11, 30);
+    d.setDate(d.getDate() + Math.floor(v));
+    return dateOnly(d);
+  }
+  if (typeof v === "string") {
+    const s: string = v.trim();
+    if (!s) return null;
+    const iso: RegExpMatchArray | null = s.match(/^(\d{4})[-\/](\d{2})[-\/](\d{2})$/);
+    if (iso) {
+      const yyyy: number = Number(iso[1]), mm: number = Number(iso[2]) - 1, dd: number = Number(iso[3]);
+      const d1: Date = new Date(yyyy, mm, dd);
+      return isNaN(d1.getTime()) ? null : dateOnly(d1);
+    }
+    if (/^\d+(\.\d+)?$/.test(s)) {
+      const serial: number = Number(s);
+      const d2: Date = new Date(1899, 11, 30);
+      d2.setDate(d2.getDate() + Math.floor(serial));
+      return dateOnly(d2);
+    }
+    const d3: Date = new Date(s);
+    return isNaN(d3.getTime()) ? null : dateOnly(d3);
+  }
+  return null;
+}
+function asNumber(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  if (typeof v === "number" && !isNaN(v)) return v;
+  const n: number = Number(v as string | number);
+  return isNaN(n) ? null : n;
+}
+function asString(v: unknown): string { return v == null ? "" : String(v).trim(); }
+function toStatus(v: string): StatusType { return v === "Active" ? "Active" : "Inactive"; }
+function toDist(v: string): DistMethod { return v === "Recurring Monthly" ? "Recurring Monthly" : "Standard"; }
+function toAssign(v: string): AssignType {
+  if (v === "Exclusive-ShareOne") return "Exclusive-ShareOne";
+  if (v === "Exclusive-DoNotShare") return "Exclusive-DoNotShare";
+  return "Primary-ShareProportion";
+}
+function fmtYMD(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function mmdd(d: Date): string { return `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`; }
+function firstOfMonth(d: Date): Date { return new Date(d.getFullYear(), d.getMonth(), 1); }
+function lastOfMonth(d: Date): Date { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
+function cloneDate(d: Date): Date { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function isBetween(d: Date, start: Date, end: Date): boolean {
+  const t: number = d.getTime(); return t >= start.getTime() && t <= end.getTime();
+}
+function rangeDays(start: Date, end: Date): Date[] {
+  const out: Date[] = [];
+  const cur: Date = cloneDate(start);
+  while (cur.getTime() <= end.getTime()) { out.push(new Date(cur)); cur.setDate(cur.getDate() + 1); }
+  return out;
+}
+function monthKey(d: Date): string { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
+function weekKey(d: Date): string {
+  const tmp: Date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const day: number = (tmp.getUTCDay() + 6) % 7;
+  tmp.setUTCDate(tmp.getUTCDate() - day + 3);
+  const wk1: Date = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 4));
+  const week: number = 1 + Math.round(((tmp.getTime() - wk1.getTime()) / 86400000 - 3) / 7);
+  return `${tmp.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+const EXPECTED: { [tableName: string]: string[] } = {
+  Configurations: ["ConfigId", "Name", "Value", "Status", "Description"],
+  Calendar: ["Date", "Year", "Month", "AvailableHours"],
+  Projects: ["ProjectKey", "ProjectId", "ProjectName", "Description", "Project Manager", "TotalHours", "PreviouslyUsedHours", "RemainingHours", "StartDate", "EndDate", "Status", "Distribution Method", "PrimaryResourceId", "PrimaryResourceName", "PrimaryResourceAssignmentType"],
+  Resources: ["ResourceId", "ResourceName", "Role", "StartDate", "EndDate", "Status"],
+  ResourceAvailability: ["ResourceId", "Date", "UnavailableHours", "Reason"]
+};
+
+function sanitizeSheetNameRaw(name: string): string {
+  const invalid: RegExp = /[\\\/\?\*\:\[\]]/g;
+  let clean: string = name.replace(invalid, "").trim();
+  if (clean.length === 0) clean = "Sheet";
+  if (clean.length > 31) clean = clean.slice(0, 31);
+  return clean;
+}
+function getUniqueSheetName(workbook: ExcelScript.Workbook, desired: string): string {
+  const base: string = sanitizeSheetNameRaw(desired);
+  const exists = (n: string): boolean => workbook.getWorksheet(n) !== undefined;
+  if (!exists(base)) return base;
+  for (let i = 1; i < 100; i++) {
+    const suffix: string = `_${i}`;
+    const truncated: string = base.slice(0, Math.max(0, 31 - suffix.length));
+    const candidate: string = `${truncated}${suffix}`;
+    if (!exists(candidate)) return candidate;
+  }
+  const rnd: string = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+  return sanitizeSheetNameRaw(`${base}_${rnd}`);
+}
+
+/////////////////////// Main ///////////////////////
+
+function main(workbook: ExcelScript.Workbook): void {
+  safeDeleteSheet(workbook, "ValidationErrors");
+
+  const errors: string[] = [];
+  const tables: Dict<ExcelScript.Table> = getTablesByName(workbook);
+
+  // Presence & schema
+  Object.keys(EXPECTED).forEach((tName: string): void => { if (!tables[tName]) errors.push(`Missing required table: ${tName}`); });
+  Object.entries(EXPECTED).forEach(([tName, cols]: [string, string[]]): void => {
+    const t: ExcelScript.Table | undefined = tables[tName];
+    if (!t) return;
+    const headers: string[] = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+    cols.forEach((col: string): void => { if (!headers.includes(col)) errors.push(`Table "${tName}" is missing column "${col}". Found: [${headers.join(", ")}]`); });
+  });
+  if (errors.length) { writeValidationErrors(workbook, errors); return; }
+
+  // Config
+  const config: Config = readConfigurations(tables.Configurations);
+  const dailyHours: number | null = config.dailyHours;
+  const forecastStart: Date | null = config.forecastStart;
+  const forecastEnd: Date | null = config.forecastEnd;
+
+  if (forecastStart && forecastEnd) {
+    const y1: number = forecastStart.getFullYear();
+    const y2: number = forecastEnd.getFullYear();
+    if (y1 < 1900 || y1 > 2100 || y2 < 1900 || y2 > 2100) {
+      writeValidationErrors(workbook, [`Configurations dates look invalid after parsing: ${fmtYMD(forecastStart)} .. ${fmtYMD(forecastEnd)}`]);
+      return;
+    }
+  }
+  if (!forecastStart || !forecastEnd) errors.push(`Configurations must include valid "Forecast Start Date" and "Forecast End Date".`);
+  else if (forecastStart.getTime() > forecastEnd.getTime()) errors.push(`Configurations: Forecast Start Date must be <= Forecast End Date.`);
+  if (dailyHours == null || dailyHours <= 0) errors.push(`Configurations must include a positive "Daily Available Hours".`);
+  if (errors.length) { writeValidationErrors(workbook, errors); return; }
+
+  // Inputs
+  const cal: Dict<number> = readCalendar(tables.Calendar, forecastStart, forecastEnd, errors);
+  const projects: ProjectRow[] = readProjects(tables.Projects, forecastStart, forecastEnd, errors);
+  const resources: ResourceRow[] = readResources(tables.Resources, forecastStart, forecastEnd, errors);
+  const unavail: Dict<number> = readResourceAvailability(tables.ResourceAvailability);
+
+  // Validate primary resource refs
+  for (let i = 0; i < projects.length; i++) {
+    const p: ProjectRow = projects[i];
+    if (p.primaryId && !resourcesById[p.primaryId]) {
+      errors.push(`Projects: PrimaryResourceId "${p.primaryId}" not found among active, in-range Resources for project ${p.id} (${p.name}).`);
+    }
+    if ((p.assignType === "Exclusive-ShareOne" || p.assignType === "Exclusive-DoNotShare" || p.assignType === "Primary-ShareProportion") && !p.primaryId) {
+      errors.push(`Projects: Missing PrimaryResourceId for project ${p.id} (${p.name}) with assignment type ${p.assignType}.`);
+    }
+  }
+  if (errors.length) { writeValidationErrors(workbook, errors); return; }
+
+  // Backup snapshot
+  createBackupWorksheet(workbook, tables);
+
+  // Per-day availability per resource
+  const dateKeys: string[] = [];
+  const perDayAvail: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+  const daysAll: Date[] = rangeDays(forecastStart, forecastEnd);
+  for (let i = 0; i < daysAll.length; i++) {
+    const d: Date = daysAll[i];
+    const key: string = fmtYMD(d);
+    dateKeys.push(key);
+    const calHours: number = cal[key] ?? dailyHours!;
+    const dayAvail: Dict<number> = {} as Dict<number>;
+    for (let j = 0; j < resources.length; j++) {
+      const r: ResourceRow = resources[j];
+      if (!isBetween(d, r.start, r.end)) continue;
+      const dayBase: number = Math.min(calHours, dailyHours!);
+      const ua: number = unavail[`${r.id}|${key}`] ?? 0;
+      const avail: number = Math.max(0, dayBase - ua);
+      dayAvail[r.id] = avail;
+    }
+    perDayAvail[key] = dayAvail;
+  }
+
+  // Pools
+  const projectPools: Dict<ProjectRemaining> = {} as Dict<ProjectRemaining>;
+  for (let i = 0; i < projects.length; i++) projectPools[projects[i].key] = { totalRemaining: projects[i].remaining, monthlyRemaining: {} as Dict<number> };
+  let iterMonth: Date = new Date(forecastStart.getFullYear(), forecastStart.getMonth(), 1);
+  const endMonth: Date = new Date(forecastEnd.getFullYear(), forecastEnd.getMonth(), 1);
+  while (iterMonth.getTime() <= endMonth.getTime()) {
+    const mkInit: string = monthKey(iterMonth);
+    for (let i = 0; i < projects.length; i++) {
+      const p: ProjectRow = projects[i];
+      projectPools[p.key].monthlyRemaining[mkInit] = (p.distMethod === "Recurring Monthly") ? p.remaining : 0;
+    }
+    iterMonth = new Date(iterMonth.getFullYear(), iterMonth.getMonth() + 1, 1);
+  }
+
+  // Fairness tracking
+  const monthAlloc: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+  const weekAlloc: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+  for (let i = 0; i < projects.length; i++) { monthAlloc[projects[i].key] = {} as Dict<number>; weekAlloc[projects[i].key] = {} as Dict<number>; }
+
+  // Results
+  const resAlloc: ResAlloc[] = [];
+  const proAlloc: ProAlloc[] = [];
+  const assignedPerDay: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+  for (let i = 0; i < dateKeys.length; i++) assignedPerDay[dateKeys[i]] = {} as Dict<number>;
+  const getAssignedMap = (dk: string): Dict<number> => { if (!assignedPerDay[dk]) assignedPerDay[dk] = {} as Dict<number>; return assignedPerDay[dk]; };
+
+  // Config knobs (defaults updated: monthly floor now 0.5h)
+  const MIN_MONTHLY_SHARE: number = config.minMonthlyShare ?? QUANTUM;
+  const MIN_WEEKLY_SHARE: number = config.minWeeklyShare ?? QUANTUM;
+  const EOL_WINDOW_DAYS: number = config.eolWindowDays ?? 21;
+  const EOL_MAX_BOOST: number = config.eolMaxBoost ?? 3;
+
+  // Helpers
+  function pushAlloc(p: ProjectRow, r: ResourceRow, d: Date, grant: number, note: string): void {
+    const dk: string = fmtYMD(d);
+    const mk: string = monthKey(d);
+    const wk: string = weekKey(d);
+    const map: Dict<number> = getAssignedMap(dk);
+    map[r.id] = (map[r.id] ?? 0) + grant;
+
+    resAlloc.push({ ResourceId: r.id, ResourceName: r.name, ProjectKey: p.key, ProjectId: p.id, ProjectName: p.name, Date: dk, Hours: grant, Notes: note });
+    proAlloc.push({ ProjectKey: p.key, ProjectId: p.id, ProjectName: p.name, ProjectManager: p.pm, Date: dk, Hours: grant, Notes: note });
+
+    monthAlloc[p.key][mk] = (monthAlloc[p.key][mk] ?? 0) + grant;
+    weekAlloc[p.key][wk] = (weekAlloc[p.key][wk] ?? 0) + grant;
+  }
+
+  function assignHours(p: ProjectRow, r: ResourceRow, d: Date, hoursRequested: number, note: string): number {
+    if (hoursRequested <= 0) return 0;
+    const dk: string = fmtYMD(d);
+    const mk: string = monthKey(d);
+    const dayCap: number = (perDayAvail[dk]?.[r.id] ?? 0);
+    const already: number = getAssignedMap(dk)[r.id] ?? 0;
+    const room: number = Math.max(0, dayCap - already);
+    if (room < QUANTUM) return 0;
+
+    const pools: ProjectRemaining = projectPools[p.key];
+
+    // Calculate theoretical cap from pools
+    let poolRemain: number = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : pools.totalRemaining;
+    if (poolRemain < QUANTUM) return 0;
+
+    // Determine grant and quantize down to 0.5
+    let grant: number = Math.min(hoursRequested, room, poolRemain);
+    grant = quantizeDown(grant);
+    if (grant < QUANTUM) return 0;
+
+    if (p.distMethod === "Recurring Monthly") {
+      projectPools[p.key].monthlyRemaining[mk] = (pools.monthlyRemaining[mk] ?? 0) - grant;
+    } else {
+      projectPools[p.key].totalRemaining = pools.totalRemaining - grant;
+    }
+
+    pushAlloc(p, r, d, grant, note);
+    return grant;
+  }
+
+  function monthsOverlap(mStart: Date, pStart: Date, pEnd: Date): boolean {
+    const mEnd: Date = lastOfMonth(mStart);
+    return !(mEnd.getTime() < pStart.getTime() || mStart.getTime() > pEnd.getTime());
+  }
+  function firstWorkingDayForResourceInMonth(r: ResourceRow, monthAnyDay: Date, p: ProjectRow): Date | null {
+    const start: Date = firstOfMonth(monthAnyDay);
+    const end: Date = lastOfMonth(monthAnyDay);
+    const days: Date[] = rangeDays(start, end);
+    for (let i = 0; i < days.length; i++) {
+      const d: Date = days[i];
+      if (!isBetween(d, r.start, r.end)) continue;
+      if (!isBetween(d, p.start, p.end)) continue;
+      const dk: string = fmtYMD(d);
+      const room: number = Math.max(0, (perDayAvail[dk]?.[r.id] ?? 0) - (getAssignedMap(dk)[r.id] ?? 0));
+      if (room >= QUANTUM) return d;
+    }
+    return null;
+  }
+  function iterateMonths(start: Date, end: Date, fn: (monthStart: Date) => void): void {
+    let m: Date = new Date(start.getFullYear(), start.getMonth(), 1);
+    const endM: Date = new Date(end.getFullYear(), end.getMonth(), 1);
+    while (m.getTime() <= endM.getTime()) { fn(new Date(m)); m = new Date(m.getFullYear(), m.getMonth() + 1, 1); }
+  }
+  function anyWorkingDayForResourceInMonth(r: ResourceRow, monthAnyDay: Date, p: ProjectRow): boolean {
+    const start: Date = firstOfMonth(monthAnyDay);
+    const end: Date = lastOfMonth(monthAnyDay);
+    const days: Date[] = rangeDays(start, end);
+    for (let i = 0; i < days.length; i++) {
+      const d: Date = days[i];
+      if (!isBetween(d, r.start, r.end)) continue;
+      if (!isBetween(d, p.start, p.end)) continue;
+      return true;
+    }
+    return false;
+  }
+  function daysToEnd(p: ProjectRow, d: Date): number { return Math.floor((p.end.getTime() - d.getTime()) / 86400000); }
+  function eolBoost(p: ProjectRow, d: Date): number {
+    const rem: number = daysToEnd(p, d);
+    if (rem > EOL_WINDOW_DAYS) return 1;
+    const frac: number = Math.max(0, (EOL_WINDOW_DAYS - Math.max(0, rem)) / Math.max(1, EOL_WINDOW_DAYS));
+    return 1 + (EOL_MAX_BOOST - 1) * frac;
+  }
+  function needsMonthlyFloor(p: ProjectRow, d: Date): boolean {
+    const mk: string = monthKey(d);
+    const got: number = monthAlloc[p.key][mk] ?? 0;
+    const left: number = (p.distMethod === "Recurring Monthly") ? (projectPools[p.key].monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
+    return got + EPS < MIN_MONTHLY_SHARE && left >= QUANTUM;
+  }
+  function needsWeeklyNudge(p: ProjectRow, d: Date): boolean {
+    const wk: string = weekKey(d);
+    const got: number = weekAlloc[p.key][wk] ?? 0;
+    const mk: string = monthKey(d);
+    const left: number = (p.distMethod === "Recurring Monthly") ? (projectPools[p.key].monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
+    return (MIN_WEEKLY_SHARE > 0) && got + EPS < MIN_WEEKLY_SHARE && left >= QUANTUM;
+  }
+
+  // ===== PASS A: Exclusive-DoNotShare (unchanged) =====
+  iterateMonths(forecastStart, forecastEnd, (mStart: Date): void => {
+    const listA: ProjectRow[] = projects.filter((pp: ProjectRow): boolean => pp.assignType === "Exclusive-DoNotShare");
+    listA.forEach((p: ProjectRow): void => {
+      if (!monthsOverlap(mStart, p.start, p.end)) return;
+      const primary: ResourceRow | undefined = resourcesById[p.primaryId];
+      if (!primary) return;
+      const fd: Date | null = firstWorkingDayForResourceInMonth(primary, mStart, p);
+      if (!fd) return;
+      const mk: string = monthKey(fd);
+      const pool: number = (p.distMethod === "Recurring Monthly") ? (projectPools[p.key].monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
+      const ask: number = quantizeDown(pool);
+      if (ask >= QUANTUM) assignHours(p, primary, fd, ask, "Exclusive-DoNotShare (first working day)");
+    });
+  });
+
+  // ===== PASS B: Exclusive-ShareOne (unchanged) =====
+  iterateMonths(forecastStart, forecastEnd, (mStart: Date): void => {
+    const mEnd: Date = lastOfMonth(mStart);
+    const mk: string = monthKey(mStart);
+    const monthDays: Date[] = rangeDays(mStart, mEnd);
+    const listB: ProjectRow[] = projects.filter((pp: ProjectRow): boolean => pp.assignType === "Exclusive-ShareOne");
+    listB.forEach((p: ProjectRow): void => {
+      if (!monthsOverlap(mStart, p.start, p.end)) return;
+      const primary: ResourceRow | undefined = resourcesById[p.primaryId];
+      let assigned: number = 0;
+
+      const tryAssignTo = (res: ResourceRow): number => {
+        const fd: Date | null = firstWorkingDayForResourceInMonth(res, mStart, p);
+        if (!fd) return 0;
+        const pool: number = (p.distMethod === "Recurring Monthly") ? (projectPools[p.key].monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
+        const ask: number = quantizeDown(pool);
+        if (ask < QUANTUM) return 0;
+        const label: string = (primary && res.id === primary.id ? "Exclusive-ShareOne (primary)" : "Exclusive-ShareOne (reassigned)");
+        return assignHours(p, res, fd, ask, label);
+      };
+
+      if (primary) assigned = tryAssignTo(primary);
+      if (assigned <= 0) {
+        const monthResTotals: Dict<number> = {} as Dict<number>;
+        for (let i = 0; i < monthDays.length; i++) {
+          const d: Date = monthDays[i];
+          const dk: string = fmtYMD(d);
+          const availMap: Dict<number> | undefined = perDayAvail[dk];
+          const ids: string[] = availMap ? Object.keys(availMap) : [];
+          for (let j = 0; j < ids.length; j++) {
+            const rid: string = ids[j];
+            const prevTot: number = monthResTotals[rid] ?? 0;
+            const got: number = (assignedPerDay[dk]?.[rid] ?? 0);
+            monthResTotals[rid] = prevTot + got;
+          }
+        }
+        const candidates: ResourceRow[] = resources
+          .filter((r: ResourceRow): boolean => anyWorkingDayForResourceInMonth(r, mStart, p))
+          .sort((a: ResourceRow, b: ResourceRow): number => (monthResTotals[a.id] ?? 0) - (monthResTotals[b.id] ?? 0));
+        for (let i = 0; i < candidates.length; i++) {
+          const res: ResourceRow = candidates[i];
+          assigned = tryAssignTo(res);
+          if (assigned > 0) break;
+        }
+      }
+    });
+  });
+
+  // ===== PASS C0: Monthly seeding (NEW) — ensure each qualifying project gets some hours this month =====
+  iterateMonths(forecastStart, forecastEnd, (mStart: Date): void => {
+    const mk: string = monthKey(mStart);
+    const mEnd: Date = lastOfMonth(mStart);
+    const days: Date[] = rangeDays(mStart, mEnd);
+
+    // helper: find a slot (resource + day) with room for project p this month
+    const findSeedSlot = (p: ProjectRow): { r: ResourceRow; d: Date } | null => {
+      const candidateResources: ResourceRow[] = (p.assignType === "Exclusive-DoNotShare" || p.assignType === "Exclusive-ShareOne" || p.assignType === "Primary-ShareProportion")
+        ? (resourcesById[p.primaryId] ? [resourcesById[p.primaryId]] : [])
+        : resources;
+
+      for (let idy = 0; idy < days.length; idy++) {
+        const d: Date = days[idy];
+        if (!isBetween(d, p.start, p.end)) continue;
+        const dk: string = fmtYMD(d);
+        for (let ir = 0; ir < candidateResources.length; ir++) {
+          const r: ResourceRow = candidateResources[ir];
+          if (!isBetween(d, r.start, r.end)) continue;
+          const room: number = Math.max(0, (perDayAvail[dk]?.[r.id] ?? 0) - (getAssignedMap(dk)[r.id] ?? 0));
+          if (room >= QUANTUM) return { r, d };
+        }
+        // fall back to any resource if primary path didn't find room
+        if (candidateResources.length > 0 && candidateResources.length < resources.length) {
+          for (let ir = 0; ir < resources.length; ir++) {
+            const r2: ResourceRow = resources[ir];
+            if (!isBetween(d, r2.start, r2.end)) continue;
+            const room2: number = Math.max(0, (perDayAvail[dk]?.[r2.id] ?? 0) - (getAssignedMap(dk)[r2.id] ?? 0));
+            if (room2 >= QUANTUM) return { r: r2, d };
+          }
+        }
+      }
+      return null;
+    };
+
+    for (let ip = 0; ip < projects.length; ip++) {
+      const p: ProjectRow = projects[ip];
+      if (!monthsOverlap(mStart, p.start, p.end)) continue;
+
+      const pools: ProjectRemaining = projectPools[p.key];
+      const left: number = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : pools.totalRemaining;
+      if (left < QUANTUM) continue;
+
+      const got: number = monthAlloc[p.key][mk] ?? 0;
+      if (got + EPS >= MIN_MONTHLY_SHARE) continue; // already met floor
+
+      const slot = findSeedSlot(p);
+      if (slot) assignHours(p, slot.r, slot.d, QUANTUM, "Monthly seed");
+    }
+  });
+
+  // ===== PASS C: Primary-ShareProportion (unchanged logic; obeys quantum via assignHours) =====
+  const listC: ProjectRow[] = projects.filter((pp: ProjectRow): boolean => pp.assignType === "Primary-ShareProportion");
+  listC.forEach((p: ProjectRow): void => {
+    const primary: ResourceRow | undefined = resourcesById[p.primaryId];
+    if (!primary) return;
+    iterateMonths(forecastStart, forecastEnd, (mStart: Date): void => {
+      if (!monthsOverlap(mStart, p.start, p.end)) return;
+      const mEnd: Date = lastOfMonth(mStart);
+      const monthDays2: Date[] = rangeDays(mStart, mEnd).filter((d: Date): boolean => isBetween(d, p.start, p.end));
+      for (let i = 0; i < monthDays2.length; i++) {
+        const d: Date = monthDays2[i];
+        const mk: string = monthKey(d);
+        const pools: ProjectRemaining = projectPools[p.key];
+        const remaining: number = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : pools.totalRemaining;
+        if (remaining < QUANTUM) continue;
+        const dk: string = fmtYMD(d);
+        const dayRoom: number = Math.max(0, (perDayAvail[dk]?.[primary.id] ?? 0) - (getAssignedMap(dk)[primary.id] ?? 0));
+        if (dayRoom < QUANTUM) continue;
+
+        let remainingDays: number = 0;
+        for (let j = 0; j < monthDays2.length; j++) {
+          const dd: Date = monthDays2[j];
+          const ddk: string = fmtYMD(dd);
+          const room: number = Math.max(0, (perDayAvail[ddk]?.[primary.id] ?? 0) - (getAssignedMap(ddk)[primary.id] ?? 0));
+          if (room >= QUANTUM) remainingDays++;
+        }
+        const rawTarget: number = Math.max(0, Math.min(dayRoom, Math.ceil(remaining / Math.max(1, remainingDays))));
+        const target: number = quantizeDown(rawTarget);
+        if (target >= QUANTUM) assignHours(p, primary, d, target, "Primary-ShareProportion (primary)");
+      }
+    });
+  });
+
+  // ===== PASS D: Daily Borrowing — fair round-robin with 0.5h quantum (UPDATED) =====
+  for (let di = 0; di < daysAll.length; di++) {
+    const d: Date = daysAll[di];
+    const dk: string = fmtYMD(d);
+    const mkToday: string = monthKey(d);
+
+    const needy: { r: ResourceRow; room: number }[] = resources
+      .filter((r: ResourceRow): boolean => isBetween(d, r.start, r.end))
+      .map((r: ResourceRow): { r: ResourceRow; room: number } => {
+        const cap: number = perDayAvail[dk]?.[r.id] ?? 0;
+        const got: number = getAssignedMap(dk)[r.id] ?? 0;
+        return { r, room: Math.max(0, cap - got) };
+      })
+      .filter((x: { r: ResourceRow; room: number }): boolean => x.room >= QUANTUM)
+      .sort((a: { r: ResourceRow; room: number }, b: { r: ResourceRow; room: number }): number => b.room - a.room);
+
+    if (needy.length === 0) continue;
+
+    const candListBase: ProjectRow[] = projects.filter((p: ProjectRow): boolean => isBetween(d, p.start, p.end));
+    const baseCandidates: Cand[] = candListBase
+      .map((p: ProjectRow): Cand => {
+        const pools: ProjectRemaining = projectPools[p.key];
+        const left: number = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mkToday] ?? 0) : projectPools[p.key].totalRemaining;
+        const needMonth: number = needsMonthlyFloor(p, d) ? 1 : 0;
+        const needWeek: number = needsWeeklyNudge(p, d) ? 1 : 0;
+        const boost: number = eolBoost(p, d);
+        const pr: [number, number, number, number] = [needMonth, needWeek, boost, left];
+        return { p, left, prioKey: pr };
+      })
+      .filter((c: Cand): boolean => c.left >= QUANTUM);
+
+    for (let ni = 0; ni < needy.length; ni++) {
+      const need: { r: ResourceRow; room: number } = needy[ni];
+      if (need.room < QUANTUM) continue;
+
+      let candidates: Cand[] = baseCandidates
+        .filter((c: Cand): boolean => c.left >= QUANTUM && c.p.assignType !== "Exclusive-DoNotShare")
+        .sort((a: Cand, b: Cand): number => {
+          for (let i = 0; i < 4; i++) { if (b.prioKey[i] !== a.prioKey[i]) return b.prioKey[i] - a.prioKey[i]; }
+          return 0;
+        })
+        .map((c: Cand): Cand => ({ p: c.p, left: c.left, prioKey: c.prioKey }));
+
+      if (candidates.length === 0) continue;
+
+      const MAX_ROUNDS: number = 32;
+      let rounds: number = 0;
+
+      while (need.room >= QUANTUM - EPS && candidates.length > 0 && rounds < MAX_ROUNDS) {
+        rounds++;
+
+        // Equal share, then quantize
+        const rawShare: number = need.room / candidates.length;
+        const perShare: number = Math.max(QUANTUM, quantizeDown(rawShare));
+
+        let anyGiven: boolean = false;
+
+        for (let ci = 0; ci < candidates.length; ci++) {
+          if (need.room < QUANTUM - EPS) break;
+          const cand: Cand = candidates[ci];
+
+          const noteParts: string[] = [];
+          if (cand.prioKey[0]) noteParts.push("Monthly-share");
+          if (cand.prioKey[1]) noteParts.push("Weekly-nudge");
+          if (cand.prioKey[2] > 1) noteParts.push("EOL-priority");
+          const note: string = ["Borrowing", ...noteParts].join(" / ");
+
+          const ask: number = quantizeDown(Math.min(perShare, cand.left, need.room));
+          if (ask < QUANTUM) continue;
+
+          const given: number = assignHours(cand.p, need.r, d, ask, note);
+          if (given >= QUANTUM - EPS) {
+            anyGiven = true;
+            cand.left -= given;
+            need.room -= given;
+          }
+        }
+
+        candidates = candidates.filter((c: Cand): boolean => c.left >= QUANTUM);
+
+        if (!anyGiven) {
+          // Last attempt: hand out single quanta round-robin
+          for (let ci = 0; ci < candidates.length; ci++) {
+            if (need.room < QUANTUM - EPS) break;
+            const cand: Cand = candidates[ci];
+            const given: number = assignHours(cand.p, need.r, d, QUANTUM, "Borrowing / quantum");
+            if (given >= QUANTUM - EPS) {
+              cand.left -= given;
+              need.room -= given;
+              anyGiven = true;
+            }
+          }
+          candidates = candidates.filter((c: Cand): boolean => c.left >= QUANTUM);
+        }
+
+        if (!anyGiven) break;
+      }
+    }
+  }
+
+  // ===== PASS E: Month-end top-up (best effort, obeys quantum via assignHours) =====
+  iterateMonths(forecastStart, forecastEnd, (mStart: Date): void => {
+    const mEnd: Date = lastOfMonth(mStart);
+    const mk: string = monthKey(mStart);
+    const monthDays: Date[] = rangeDays(mStart, mEnd);
+
+    for (let ip = 0; ip < projects.length; ip++) {
+      const p: ProjectRow = projects[ip];
+      if (!monthsOverlap(mStart, p.start, p.end)) continue;
+      const got: number = monthAlloc[p.key][mk] ?? 0;
+      if (got + EPS >= MIN_MONTHLY_SHARE) continue;
+
+      const pools: ProjectRemaining = projectPools[p.key];
+      let left: number = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
+      if (left < QUANTUM) continue;
+
+      let remainingNeed: number = quantizeDown(Math.min(MIN_MONTHLY_SHARE - got, left));
+      if (remainingNeed < QUANTUM) continue;
+
+      const tryDays: Date[] = monthDays.filter((d: Date): boolean => isBetween(d, p.start, p.end));
+      const primary: ResourceRow | undefined = resourcesById[p.primaryId];
+
+      const tryAssign = (resList: ResourceRow[], label: string): void => {
+        for (let idy = 0; idy < tryDays.length; idy++) {
+          const d: Date = tryDays[idy];
+          if (remainingNeed < QUANTUM) break;
+          for (let ir = 0; ir < resList.length; ir++) {
+            const r: ResourceRow = resList[ir];
+            if (!isBetween(d, r.start, r.end)) continue;
+            const given: number = assignHours(p, r, d, remainingNeed, `Monthly floor top-up (${label})`);
+            remainingNeed = quantizeDown(remainingNeed - given);
+            if (remainingNeed < QUANTUM) break;
+          }
+        }
+      };
+
+      if (p.assignType !== "Exclusive-DoNotShare" && primary) tryAssign([primary], "primary");
+      if (remainingNeed >= QUANTUM && p.assignType !== "Exclusive-DoNotShare") tryAssign(resources, "any");
+    }
+  });
+
+  // Summaries
+  const summary: (string | number)[][] = buildProjectSummary(projects, resAlloc);
+
+  // Outputs
+  writeTable(workbook, "ResourceAllocation", [
+    ["ResourceId", "ResourceName", "ProjectKey", "ProjectId", "ProjectName", "Date", "Hours", "Notes"],
+    ...resAlloc.map((r: ResAlloc): (string | number)[] => [r.ResourceId, r.ResourceName, r.ProjectKey, r.ProjectId, r.ProjectName, r.Date, r.Hours, r.Notes])
+  ]);
+
+  writeTable(workbook, "ProjectAllocation", [
+    ["ProjectKey", "ProjectId", "ProjectName", "ProjectManager", "Date", "Hours", "Notes"],
+    ...proAlloc.map((p: ProAlloc): (string | number)[] => [p.ProjectKey, p.ProjectId, p.ProjectName, p.ProjectManager, p.Date, p.Hours, p.Notes])
+  ]);
+
+  // ProjectSummary — only requested hours fields
+  writeTable(workbook, "ProjectSummary", [
+    ["ProjectKey", "ProjectId", "ProjectName", "Description", "Project Manager", "StartDate", "EndDate", "Status", "Remaining_Hours_At_Start", "Allocated_Hours", "Unallocated_Hours"],
+    ...summary
+  ]);
+
+  writeProjectGantts(workbook, "ProjectGantt", projects, proAlloc, forecastStart, forecastEnd);
+  writeResourceGantts(workbook, "ResourceGantt", resources, resAlloc, forecastStart, forecastEnd);
+}
+
+/////////////////////// Readers & Validators ///////////////////////
+
+function getTablesByName(workbook: ExcelScript.Workbook): Dict<ExcelScript.Table> {
+  const dict: Dict<ExcelScript.Table> = {} as Dict<ExcelScript.Table>;
+  workbook.getTables().forEach((t: ExcelScript.Table): void => { dict[t.getName()] = t; });
+  return dict;
+}
+function writeValidationErrors(workbook: ExcelScript.Workbook, errors: string[]): void {
+  const ws: ExcelScript.Worksheet = ensureSheet(workbook, "ValidationErrors", true);
+  const rows: string[][] = [["Issue"], ...errors.map((e: string): string[] => [e])];
+  const range: ExcelScript.Range = ws.getRangeByIndexes(0, 0, rows.length, 1);
+  range.setValues(rows);
+  formatHeader(ws.getRangeByIndexes(0, 0, 1, 1));
+  ws.getUsedRange()?.getFormat().autofitColumns();
+}
+function getBodyRows(t: ExcelScript.Table): Row[] {
+  const tblRange: ExcelScript.Range = t.getRange();
+  const allValues: Cell[][] = tblRange.getValues() as Cell[][];
+  if (!allValues || allValues.length <= 1) return [];
+  const hasTotals: boolean = t.getShowTotals();
+  const startRow: number = 1;
+  const endRow: number = allValues.length - (hasTotals ? 1 : 0);
+  const body: Row[] = [];
+  for (let i = startRow; i < endRow; i++) { body.push(allValues[i] as Row); }
+  return body;
+}
+function readConfigurations(t: ExcelScript.Table): Config {
+  const headers: string[] = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+  const rows: Row[] = getBodyRows(t);
+  const idx: Dict<number> = {} as Dict<number>;
+  headers.forEach((h: string, i: number): void => { idx[h] = i; });
+  const nameIdx: number = idx["Name"];
+  const valIdx: number = idx["Value"];
+  const statusIdx: number = idx["Status"];
+  const map: Dict<string> = {} as Dict<string>;
+  rows.forEach((r: Row): void => {
+    const st: string = asString(r[statusIdx]);
+    if (st && st.toLowerCase() !== "active") return;
+    const name: string = asString(r[nameIdx]);
+    const val: string = asString(r[valIdx]);
+    if (name) map[name] = val;
+  });
+  const dailyHours: number | null = asNumber(map["Daily Available Hours"] ?? null);
+  const forecastStart: Date | null = asDate(map["Forecast Start Date"] ?? null);
+  const forecastEnd: Date | null = asDate(map["Forecast End Date"] ?? null);
+  const minMonthlyShare: number | undefined = asNumber(map["Min Monthly Share Hours Per Project"] ?? null) ?? undefined;
+  const minWeeklyShare: number | undefined = asNumber(map["Min Weekly Share Hours Per Project"] ?? null) ?? undefined;
+  const eolWindowDays: number | undefined = asNumber(map["End-Date Priority Window (days)"] ?? null) ?? undefined;
+  const eolMaxBoost: number | undefined = asNumber(map["End-Date Priority Max Boost"] ?? null) ?? undefined;
+  return { dailyHours, forecastStart, forecastEnd, minMonthlyShare, minWeeklyShare, eolWindowDays, eolMaxBoost };
+}
+function readCalendar(t: ExcelScript.Table, start: Date, end: Date, errors: string[]): Dict<number> {
+  const headers: string[] = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+  const rows: Row[] = getBodyRows(t);
+  const dateIdx: number = headers.indexOf("Date");
+  const availIdx: number = headers.indexOf("AvailableHours");
+  const map: Dict<number> = {} as Dict<number>;
+  rows.forEach((r: Row): void => {
+    const d: Date | null = asDate(r[dateIdx]);
+    const ah: number | null = asNumber(r[availIdx]);
+    if (!d) { errors.push(`Calendar: invalid Date value.`); return; }
+    if (ah == null || ah < 0) { errors.push(`Calendar: invalid AvailableHours on ${d}.`); return; }
+    if (isBetween(d, start, end)) map[fmtYMD(d)] = ah;
+  });
+  return map;
+}
+function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
+  return !(aEnd.getTime() < bStart.getTime() || aStart.getTime() > bEnd.getTime());
+}
+function readProjects(t: ExcelScript.Table, fStart: Date, fEnd: Date, errors: string[]): ProjectRow[] {
+  const headers: string[] = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+  const rows: Row[] = getBodyRows(t);
+  const projectKeyIdx: number = headers.indexOf("ProjectKey");
+  const projectIdIdx: number = headers.indexOf("ProjectId");
+  const projectNameIdx: number = headers.indexOf("ProjectName");
+  const descriptionIdx: number = headers.indexOf("Description");
+  const pmIdx: number = headers.indexOf("Project Manager");
+  const totalHoursIdx: number = headers.indexOf("TotalHours");
+  const prevUsedIdx: number = headers.indexOf("PreviouslyUsedHours");
+  const remainingIdx: number = headers.indexOf("RemainingHours");
+  const startIdx: number = headers.indexOf("StartDate");
+  const endIdx: number = headers.indexOf("EndDate");
+  const statusIdx: number = headers.indexOf("Status");
+  const distIdx: number = headers.indexOf("Distribution Method");
+  const primaryResIdIdx: number = headers.indexOf("PrimaryResourceId");
+  const primaryResNameIdx: number = headers.indexOf("PrimaryResourceName");
+  const assignTypeIdx: number = headers.indexOf("PrimaryResourceAssignmentType");
+  const out: ProjectRow[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r: Row = rows[i];
+    const item: ProjectRow = {
+      key: asString(r[projectKeyIdx]),
+      id: asString(r[projectIdIdx]),
+      name: asString(r[projectNameIdx]),
+      desc: asString(r[descriptionIdx]),
+      pm: asString(r[pmIdx]),
+      total: asNumber(r[totalHoursIdx]) ?? 0,
+      prevUsed: asNumber(r[prevUsedIdx]) ?? 0,
+      remaining: asNumber(r[remainingIdx]) ?? 0,
+      start: asDate(r[startIdx]) ?? new Date("1900-01-01"),
+      end: asDate(r[endIdx]) ?? new Date("9999-12-31"),
+      status: toStatus(asString(r[statusIdx])),
+      distMethod: toDist(asString(r[distIdx])),
+      primaryId: asString(r[primaryResIdIdx]),
+      primaryName: asString(r[primaryResNameIdx]),
+      assignType: toAssign(asString(r[assignTypeIdx]))
+    };
+    if (!item.key || !item.id) { errors.push(`Projects: missing ProjectKey/ProjectId for row "${item.name}".`); continue; }
+    if (item.remaining < 0) { errors.push(`Projects: RemainingHours cannot be negative for ${item.id}.`); continue; }
+    if (item.status !== "Active") continue;
+    if (!overlaps(item.start, item.end, fStart, fEnd)) continue;
+    out.push(item);
+  }
+  return out;
+}
+function readResources(t: ExcelScript.Table, fStart: Date, fEnd: Date, errors: string[]): ResourceRow[] {
+  const headers: string[] = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+  const rows: Row[] = getBodyRows(t);
+  const resIdIdx: number = headers.indexOf("ResourceId");
+  const resNameIdx: number = headers.indexOf("ResourceName");
+  const roleIdx: number = headers.indexOf("Role");
+  const startIdx: number = headers.indexOf("StartDate");
+  const endIdx: number = headers.indexOf("EndDate");
+  const statusIdx: number = headers.indexOf("Status");
+  const out: ResourceRow[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r: Row = rows[i];
+    const item: ResourceRow = {
+      id: asString(r[resIdIdx]),
+      name: asString(r[resNameIdx]),
+      role: asString(r[roleIdx]),
+      start: asDate(r[startIdx]) ?? new Date("1900-01-01"),
+      end: asDate(r[endIdx]) ?? new Date("9999-12-31"),
+      status: toStatus(asString(r[statusIdx]))
+    };
+    if (!item.id) { errors.push(`Resources: missing ResourceId for "${item.name}".`); continue; }
+    if (item.status !== "Active") continue;
+    if (!overlaps(item.start, item.end, fStart, fEnd)) continue;
+    out.push(item);
+  }
+  resourcesById = {} as Dict<ResourceRow>;
+  for (let i = 0; i < out.length; i++) resourcesById[out[i].id] = out[i];
+  return out;
+}
+function readResourceAvailability(t: ExcelScript.Table): Dict<number> {
+  const headers: string[] = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+  const rows: Row[] = getBodyRows(t);
+  const resIdIdx: number = headers.indexOf("ResourceId");
+  const dateIdx: number = headers.indexOf("Date");
+  const uaIdx: number = headers.indexOf("UnavailableHours");
+  const map: Dict<number> = {} as Dict<number>;
+  for (let i = 0; i < rows.length; i++) {
+    const r: Row = rows[i];
+    const rid: string = asString(r[resIdIdx]);
+    const d: Date | null = asDate(r[dateIdx]);
+    const ua: number = asNumber(r[uaIdx]) ?? 0;
+    if (!rid || !d) continue;
+    map[`${rid}|${fmtYMD(d)}`] = Math.max(0, ua);
+  }
+  return map;
+}
+
+/////////////////////// Writers & Formatting ///////////////////////
+
+function writeTable(workbook: ExcelScript.Workbook, sheetName: string, rows: (string | number)[][]): void {
+  safeDeleteSheet(workbook, sheetName);
+  const ws: ExcelScript.Worksheet = workbook.addWorksheet(sheetName);
+  const r: ExcelScript.Range = ws.getRangeByIndexes(0, 0, rows.length, rows[0].length);
+  r.setValues(rows);
+  formatHeader(ws.getRangeByIndexes(0, 0, 1, rows[0].length));
+  ws.getUsedRange()?.getFormat().autofitColumns();
+}
+
+function cleanupGanttSheets(workbook: ExcelScript.Workbook, baseName: string, keepYears: Set<number>): void {
+  const pattern: RegExp = new RegExp(`^${baseName}_(\\d{4})$`);
+  const toDelete: string[] = [];
+  const sheets: ExcelScript.Worksheet[] = workbook.getWorksheets();
+  for (let i = 0; i < sheets.length; i++) {
+    const name: string = sheets[i].getName();
+    const m: RegExpMatchArray | null = name.match(pattern);
+    if (!m) continue;
+    const y: number = Number(m[1]);
+    if (!keepYears.has(y)) toDelete.push(name);
+  }
+  for (let i = 0; i < toDelete.length; i++) {
+    const ws = workbook.getWorksheet(toDelete[i]);
+    if (ws) ws.delete();
+  }
+}
+
+/** Exactly one Project Gantt per year within [start..end]. */
+function writeProjectGantts(
+  workbook: ExcelScript.Workbook,
+  baseName: string,
+  projects: ProjectRow[],
+  proAlloc: ProAlloc[],
+  start: Date,
+  end: Date
+): void {
+  const firstYear = start.getFullYear();
+  const lastYear = end.getFullYear();
+  if (lastYear - firstYear > 25) {
+    writeValidationErrors(workbook, [`Gantt year span too large: ${firstYear}..${lastYear}. Check configuration dates.`]);
+    return;
+  }
+  const keepYears = new Set<number>();
+  for (let y = firstYear; y <= lastYear; y++) keepYears.add(y);
+  cleanupGanttSheets(workbook, baseName, keepYears);
+
+  const allocIndex: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+  for (let i = 0; i < proAlloc.length; i++) {
+    const pa = proAlloc[i];
+    (allocIndex[pa.ProjectKey] ??= {} as Dict<number>)[pa.Date] =
+      ((allocIndex[pa.ProjectKey][pa.Date] ?? 0) + pa.Hours);
+  }
+
+  for (let year = firstYear; year <= lastYear; year++) {
+    const sheetName = `${baseName}_${year}`;
+    safeDeleteSheet(workbook, sheetName);
+    const ws = workbook.addWorksheet(sheetName);
+
+    const yStart = (year === firstYear) ? new Date(start.getFullYear(), start.getMonth(), start.getDate()) : new Date(year, 0, 1);
+    const yEnd = (year === lastYear) ? new Date(end.getFullYear(), end.getMonth(), end.getDate()) : new Date(year, 11, 31);
+
+    const days = rangeDays(yStart, yEnd);
+    if (days.length === 0) { ws.getRange("A1").setValue("No days in this year within forecast."); continue; }
+
+    const headers: string[] = ["ProjectKey", "ProjectId", "ProjectName", ...days.map((d: Date): string => mmdd(d)), "Total Allocated Hours (Year)"];
+    const headerRange = ws.getRangeByIndexes(0, 0, 1, headers.length);
+    headerRange.setValues([headers]);
+    formatHeader(headerRange);
+
+    let row = 1;
+    for (let ip = 0; ip < projects.length; ip++) {
+      const p = projects[ip];
+      if (p.end.getFullYear() < year || p.start.getFullYear() > year) continue;
+
+      const line: (string | number)[] = [p.key, p.id, p.name];
+      let yearSum = 0;
+      for (let id = 0; id < days.length; id++) {
+        const d = days[id];
+        if (!isBetween(d, p.start, p.end)) { line.push(0); continue; }
+        const v = allocIndex[p.key]?.[fmtYMD(d)] ?? 0;
+        line.push(v);
+        yearSum += v;
+      }
+      line.push(yearSum);
+      ws.getRangeByIndexes(row, 0, 1, line.length).setValues([line]);
+      row++;
+    }
+    ws.getUsedRange()?.getFormat().autofitColumns();
+  }
+}
+
+/** Exactly one Resource Gantt per year within [start..end].
+ *  Do NOT aggregate rows by ProjectId; keep separate lines per ProjectId+ProjectName. */
+function writeResourceGantts(
+  workbook: ExcelScript.Workbook,
+  baseName: string,
+  resources: ResourceRow[],
+  resAlloc: ResAlloc[],
+  start: Date,
+  end: Date
+): void {
+  const firstYear = start.getFullYear();
+  const lastYear = end.getFullYear();
+  if (lastYear - firstYear > 25) {
+    writeValidationErrors(workbook, [`Gantt year span too large: ${firstYear}..${lastYear}. Check configuration dates.`]);
+    return;
+  }
+  const keepYears = new Set<number>();
+  for (let y = firstYear; y <= lastYear; y++) keepYears.add(y);
+  cleanupGanttSheets(workbook, baseName, keepYears);
+
+  // Indices - include ProjectName to keep rows separate
+  const hoursIdx: Dict<number> = {} as Dict<number>;                // ResourceId|ProjectId|ProjectName|YYYY-MM-DD -> hours
+  const resCombos: Dict<Set<string>> = {} as Dict<Set<string>>;     // ResourceId -> set "ProjectId|ProjectName"
+
+  for (let i = 0; i < resAlloc.length; i++) {
+    const ra: ResAlloc = resAlloc[i];
+    const dateKey: string = ra.Date;
+    const comboKey: string = `${ra.ProjectId}|${ra.ProjectName}`;
+    const hoursKey: string = `${ra.ResourceId}|${ra.ProjectId}|${ra.ProjectName}|${dateKey}`;
+    hoursIdx[hoursKey] = (hoursIdx[hoursKey] ?? 0) + ra.Hours;
+    (resCombos[ra.ResourceId] ??= new Set<string>()).add(comboKey);
+  }
+
+  for (let year = firstYear; year <= lastYear; year++) {
+    const sheetName = `${baseName}_${year}`;
+    safeDeleteSheet(workbook, sheetName);
+    const ws = workbook.addWorksheet(sheetName);
+
+    const yStart = (year === firstYear) ? new Date(start.getFullYear(), start.getMonth(), start.getDate()) : new Date(year, 0, 1);
+    const yEnd = (year === lastYear) ? new Date(end.getFullYear(), end.getMonth(), end.getDate()) : new Date(year, 11, 31);
+    const days = rangeDays(yStart, yEnd);
+    if (days.length === 0) { ws.getRange("A1").setValue("No days in this year within forecast."); continue; }
+
+    const headers: string[] = ["ResourceId", "ResourceName", "ProjectId", "ProjectName", ...days.map((d: Date): string => mmdd(d)), "Total Allocated Hours (Year)"];
+    const headerRange = ws.getRangeByIndexes(0, 0, 1, headers.length);
+    headerRange.setValues([headers]);
+    formatHeader(headerRange);
+
+    let row = 1;
+    for (let ir = 0; ir < resources.length; ir++) {
+      const r = resources[ir];
+      if (r.end.getFullYear() < year || r.start.getFullYear() > year) continue;
+
+      const combos: string[] = Array.from(resCombos[r.id] ?? new Set<string>());
+      for (let ic = 0; ic < combos.length; ic++) {
+        const split: string[] = combos[ic].split("|");
+        const pid: string = split[0];
+        const pname: string = split.slice(1).join("|"); // in case name had '|'
+        const line: (string | number)[] = [r.id, r.name, pid, pname];
+        let total = 0;
+        for (let id = 0; id < days.length; id++) {
+          const dk = fmtYMD(days[id]);
+          const key = `${r.id}|${pid}|${pname}|${dk}`;
+          const v = hoursIdx[key] ?? 0;
+          line.push(v);
+          total += v;
+        }
+        line.push(total);
+        ws.getRangeByIndexes(row, 0, 1, line.length).setValues([line]);
+        row++;
+      }
+    }
+    ws.getUsedRange()?.getFormat().autofitColumns();
+  }
+}
+
+function ensureSheet(workbook: ExcelScript.Workbook, name: string, clear = false): ExcelScript.Worksheet {
+  let ws: ExcelScript.Worksheet | undefined = workbook.getWorksheet(name);
+  if (!ws) ws = workbook.addWorksheet(name);
+  if (clear) ws.getUsedRange()?.clear(ExcelScript.ClearApplyTo.all);
+  return ws;
+}
+function safeDeleteSheet(workbook: ExcelScript.Workbook, name: string): void {
+  const ws: ExcelScript.Worksheet | undefined = workbook.getWorksheet(name);
+  if (ws) ws.delete();
+}
+function formatHeader(r: ExcelScript.Range): void {
+  const fmt: ExcelScript.RangeFormat = r.getFormat();
+  fmt.getFill().setColor("#D9E1F2");
+  fmt.getFont().setBold(true);
+}
+function createBackupWorksheet(workbook: ExcelScript.Workbook, tables: Dict<ExcelScript.Table>): void {
+  const ts: Date = new Date();
+  const stamp: string =
+    `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, "0")}${String(ts.getDate()).padStart(2, "0")}` +
+    `_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}${String(ts.getSeconds()).padStart(2, "0")}`;
+  const desiredName: string = `__hist_${stamp}`;
+  const safeName: string = getUniqueSheetName(workbook, desiredName);
+  const ws: ExcelScript.Worksheet = workbook.addWorksheet(safeName);
+  let rIdx: number = 0;
+  const copyTable = (tName: string): void => {
+    const t: ExcelScript.Table = tables[tName];
+    if (!t) return;
+    const rng: ExcelScript.Range = t.getRange();
+    const data: (string | number | boolean)[][] = rng.getValues() as (string | number | boolean)[][];
+    if (!data || data.length === 0) return;
+    const target: ExcelScript.Range = ws.getRangeByIndexes(rIdx, 0, data.length, data[0].length);
+    target.setValues(data);
+    formatHeader(ws.getRangeByIndexes(rIdx, 0, 1, data[0].length));
+    ws.getRangeByIndexes(rIdx, data[0].length, 1, 1).setValue(tName);
+    rIdx += data.length + 2;
+  };
+  ["Configurations", "Calendar", "Projects", "Resources", "ResourceAvailability"].forEach((name: string): void => { copyTable(name); });
+  ws.getUsedRange()?.getFormat().autofitColumns();
+}
+
+/////////////////////// Summary ///////////////////////
+
+/** Only three hours columns as requested. */
+function buildProjectSummary(projects: ProjectRow[], resAlloc: ResAlloc[]): (string | number)[][] {
+  const utilByProject: Dict<number> = {} as Dict<number>;
+  resAlloc.forEach((ra: ResAlloc): void => { utilByProject[ra.ProjectKey] = (utilByProject[ra.ProjectKey] ?? 0) + ra.Hours; });
+
+  const out: (string | number)[][] = [];
+  projects.forEach((p: ProjectRow): void => {
+    const allocated: number = utilByProject[p.key] ?? 0;                 // Allocated_Hours
+    const remainingAtStart: number = p.remaining;                        // Remaining_Hours_At_Start
+    const unallocated: number = Math.max(0, remainingAtStart - allocated); // Unallocated_Hours
+    out.push([
+      p.key, p.id, p.name, p.desc, p.pm,
+      fmtYMD(p.start), fmtYMD(p.end), p.status,
+      remainingAtStart, allocated, unallocated
+    ]);
+  });
+  return out;
+}

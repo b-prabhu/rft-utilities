@@ -1,0 +1,10 @@
+Projects
+  ProjectKey	ProjectId	ProjectName	Description	Project Manager	TotalHours	PreviouslyUsedHours	RemainingHours	StartDate	EndDate	Status	Distribution Method	PrimaryResourceId	PrimaryResourceName	PrimaryResourceAssignmentType
+
+Resources
+
+  ResourceId	ResourceName	Role	StartDate	EndDate	Status
+
+ResourceAvailability
+
+  ResourceId	Date	UnavailableHours	Reason

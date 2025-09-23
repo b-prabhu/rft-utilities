@@ -1,15 +1,16 @@
 /**
  * Resource Forecast Tool — Office Script for Excel on the Web
- * Type-safe, no generators, explicit types, arrow-callbacks only.
  * Updated: 2025-09-22
  *
- * This build adds:
- * - PASS F: Monthly utilization top-up (0.5h round-robin) to reach 100% resource utilization per month
- *   using current-month RM pools first, then Standard pools; respects EDNS primary-only; ignores soft caps.
- * - ProjectMonthResource: adds a GRAND TOTAL row summing each Year/Month/Resource column.
+ * RM Rules:
+ *  - EDNS (Exclusive-DoNotShare): Primary-only. Entire monthly share must be assigned within the month (split over days) or it lapses.
+ *  - ES1 (Exclusive-ShareOne): Exactly one assignee per month. Prefer primary; if primary has ZERO workable capacity for the month,
+ *    reassign the ENTIRE month to exactly one alternate. Entire monthly share must be assigned in-month (split over days) or it lapses.
+ * Ordering:
+ *  - For each month, use all RM (EDNS, then ES1) first. Standard PSP runs only after RM pools are zero for that month. PSP does not lapse.
  */
 
-/////////////////////// Types & Utilities ///////////////////////
+/////////////////////// Types & Utils ///////////////////////
 
 interface Dict<T> { [key: string]: T }
 
@@ -47,15 +48,26 @@ type ProAlloc = { ProjectKey: string; ProjectId: string; ProjectName: string; Pr
 type ProjectRemaining = { totalRemaining: number; monthlyRemaining: Dict<number> };
 type Cand = { p: ProjectRow; left: number; prioKey: [number, number, number, number] };
 
-let resourcesById: Dict<ResourceRow> = {};
+// NEW: structured view of unavailability with Reasons (for pseudo-project outputs)
+type UnavailReasonEvent = { ResourceId: string; Date: string; Hours: number; Reason: string };
 
-const QUANTUM: number = 0.5;
-const EPS: number = 1e-6;
-const MAX_STD_DAILY: number = 2.0; // Standard projects per-day soft cap to keep spread
+let resourcesById: Dict<ResourceRow> = {};
+const QUANTUM = 0.5;
+const EPS = 1e-6;
+const MAX_STD_DAILY = 2.0;
+
+const EXPECTED: { [tableName: string]: string[] } = {
+    Configurations: ["ConfigId", "Name", "Value", "Status", "Description"],
+    Calendar: ["Date", "Year", "Month", "AvailableHours"],
+    Projects: ["ProjectKey", "ProjectId", "ProjectName", "Description", "Project Manager", "TotalHours", "PreviouslyUsedHours", "RemainingHours", "StartDate", "EndDate", "Status", "Distribution Method", "PrimaryResourceId", "PrimaryResourceName", "PrimaryResourceAssignmentType"],
+    Resources: ["ResourceId", "ResourceName", "Role", "StartDate", "EndDate", "Status"],
+    ResourceAvailability: ["ResourceId", "Date", "UnavailableHours", "Reason"]
+};
 
 function dateOnly(d: Date): Date { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
 function quantizeDown(x: number): number { const q = Math.floor(x / QUANTUM) * QUANTUM; return q >= QUANTUM ? q : 0; }
-
+function asString(v: unknown): string { return v == null ? "" : String(v).trim(); }
+function asNumber(v: unknown): number | null { if (v == null || v === "") return null; if (typeof v === "number" && !isNaN(v)) return v; const n = Number(v as string | number); return isNaN(n) ? null : n; }
 function asDate(v: unknown): Date | null {
     if (v instanceof Date) return isNaN(v.getTime()) ? null : dateOnly(v);
     if (typeof v === "number" && isFinite(v)) { const d = new Date(1899, 11, 30); d.setDate(d.getDate() + Math.floor(v)); return dateOnly(d); }
@@ -68,8 +80,6 @@ function asDate(v: unknown): Date | null {
     }
     return null;
 }
-function asNumber(v: unknown): number | null { if (v == null || v === "") return null; if (typeof v === "number" && !isNaN(v)) return v; const n = Number(v as string | number); return isNaN(n) ? null : n; }
-function asString(v: unknown): string { return v == null ? "" : String(v).trim(); }
 function toStatus(v: string): StatusType { return v === "Active" ? "Active" : "Inactive"; }
 function toDist(v: string): DistMethod { return v === "Recurring Monthly" ? "Recurring Monthly" : "Standard"; }
 function toAssign(v: string): AssignType { if (v === "Exclusive-ShareOne") return "Exclusive-ShareOne"; if (v === "Exclusive-DoNotShare") return "Exclusive-DoNotShare"; return "Primary-ShareProportion"; }
@@ -79,6 +89,7 @@ function mmdd(d: Date): string { return `${String(d.getMonth() + 1).padStart(2, 
 function firstOfMonth(d: Date): Date { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function lastOfMonth(d: Date): Date { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
 function cloneDate(d: Date): Date { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean { return !(aEnd.getTime() < bStart.getTime() || aStart.getTime() > bEnd.getTime()); }
 function isBetween(d: Date, start: Date, end: Date): boolean { const t = d.getTime(); return t >= start.getTime() && t <= end.getTime(); }
 function rangeDays(start: Date, end: Date): Date[] { const out: Date[] = []; const cur = cloneDate(start); while (cur.getTime() <= end.getTime()) { out.push(new Date(cur)); cur.setDate(cur.getDate() + 1); } return out; }
 function monthKey(d: Date): string { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
@@ -90,15 +101,6 @@ function weekKey(d: Date): string {
     const week = 1 + Math.round(((tmp.getTime() - wk1.getTime()) / 86400000 - 3) / 7);
     return `${tmp.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
 }
-
-const EXPECTED: { [tableName: string]: string[] } = {
-    Configurations: ["ConfigId", "Name", "Value", "Status", "Description"],
-    Calendar: ["Date", "Year", "Month", "AvailableHours"],
-    Projects: ["ProjectKey", "ProjectId", "ProjectName", "Description", "Project Manager", "TotalHours", "PreviouslyUsedHours", "RemainingHours", "StartDate", "EndDate", "Status", "Distribution Method", "PrimaryResourceId", "PrimaryResourceName", "PrimaryResourceAssignmentType"],
-    Resources: ["ResourceId", "ResourceName", "Role", "StartDate", "EndDate", "Status"],
-    ResourceAvailability: ["ResourceId", "Date", "UnavailableHours", "Reason"]
-};
-
 function sanitizeSheetNameRaw(name: string): string {
     const invalid = /[\\\/\?\*\:\[\]]/g;
     let clean = name.replace(invalid, "").trim();
@@ -106,18 +108,23 @@ function sanitizeSheetNameRaw(name: string): string {
     if (clean.length > 31) clean = clean.slice(0, 31);
     return clean;
 }
-function getUniqueSheetName(workbook: ExcelScript.Workbook, desired: string): string {
-    const base = sanitizeSheetNameRaw(desired);
-    const exists = (n: string): boolean => workbook.getWorksheet(n) !== undefined;
-    if (!exists(base)) return base;
-    for (let i = 1; i < 100; i++) {
-        const suffix = `_${i}`;
-        const truncated = base.slice(0, Math.max(0, 31 - suffix.length));
-        const candidate = `${truncated}${suffix}`;
-        if (!exists(candidate)) return candidate;
-    }
-    const rnd = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
-    return sanitizeSheetNameRaw(`${base}_${rnd}`);
+
+function ensureSheet(workbook: ExcelScript.Workbook, name: string, clear = false): ExcelScript.Worksheet {
+    let ws: ExcelScript.Worksheet | undefined = workbook.getWorksheet(name);
+    if (!ws) ws = workbook.addWorksheet(name);
+    if (clear) ws.getUsedRange()?.clear(ExcelScript.ClearApplyTo.all);
+    return ws;
+}
+
+function safeDeleteSheet(workbook: ExcelScript.Workbook, name: string): void {
+    const ws: ExcelScript.Worksheet | undefined = workbook.getWorksheet(name);
+    if (ws) ws.delete();
+}
+
+function formatHeader(r: ExcelScript.Range): void {
+    const fmt = r.getFormat();
+    fmt.getFill().setColor("#D9E1F2");
+    fmt.getFont().setBold(true);
 }
 
 /////////////////////// Main ///////////////////////
@@ -125,152 +132,143 @@ function getUniqueSheetName(workbook: ExcelScript.Workbook, desired: string): st
 function main(workbook: ExcelScript.Workbook): void {
     safeDeleteSheet(workbook, "ValidationErrors");
 
+    // Validate tables
     const errors: string[] = [];
-    const tables: Dict<ExcelScript.Table> = getTablesByName(workbook);
-
-    Object.keys(EXPECTED).forEach((tName: string): void => {
-        if (!tables[tName]) errors.push(`Missing required table: ${tName}`);
-    });
-    Object.entries(EXPECTED).forEach(([tName, cols]: [string, string[]]): void => {
-        const t = tables[tName];
-        if (!t) return;
-        const headers = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
-        cols.forEach((col: string): void => {
-            if (!headers.includes(col)) errors.push(`Table "${tName}" is missing column "${col}". Found: [${headers.join(", ")}]`);
-        });
+    const tables = getTablesByName(workbook);
+    Object.keys(EXPECTED).forEach(n => { if (!tables[n]) errors.push(`Missing required table: ${n}`); });
+    Object.entries(EXPECTED).forEach(([tName, cols]) => {
+        const t = tables[tName]; if (!t) return;
+        const headers = t.getHeaderRowRange().getValues()[0].map(h => String(h).trim());
+        cols.forEach(c => { if (!headers.includes(c)) errors.push(`Table "${tName}" missing column "${c}". Found: [${headers.join(", ")}]`); });
     });
     if (errors.length) { writeValidationErrors(workbook, errors); return; }
 
+    // Config
     const config = readConfigurations(tables.Configurations);
     const dailyHours = config.dailyHours;
-    const forecastStart = config.forecastStart;
-    const forecastEnd = config.forecastEnd;
-
-    if (forecastStart && forecastEnd) {
-        const y1 = forecastStart.getFullYear();
-        const y2 = forecastEnd.getFullYear();
-        if (y1 < 1900 || y1 > 2100 || y2 < 1900 || y2 > 2100) {
-            writeValidationErrors(workbook, [
-                `Configurations dates look invalid after parsing: ${fmtYMD(forecastStart)} .. ${fmtYMD(forecastEnd)}`
-            ]);
-            return;
-        }
-    }
-
-    if (!forecastStart || !forecastEnd) errors.push(`Configurations must include valid "Forecast Start Date" and "Forecast End Date".`);
-    else if (forecastStart.getTime() > forecastEnd.getTime()) errors.push(`Configurations: Forecast Start Date must be <= Forecast End Date.`);
-    if (dailyHours == null || dailyHours <= 0) errors.push(`Configurations must include a positive "Daily Available Hours".`);
-    if (errors.length) { writeValidationErrors(workbook, errors); return; }
+    const forecastStart = config.forecastStart!;
+    const forecastEnd = config.forecastEnd!;
+    if (!forecastStart || !forecastEnd) { writeValidationErrors(workbook, [`Configurations must include valid dates.`]); return; }
+    if (forecastStart.getTime() > forecastEnd.getTime()) { writeValidationErrors(workbook, [`Forecast Start Date must be <= End Date.`]); return; }
+    if (dailyHours == null || dailyHours <= 0) { writeValidationErrors(workbook, [`Daily Available Hours must be positive.`]); return; }
 
     // Inputs
     const cal = readCalendar(tables.Calendar, forecastStart, forecastEnd, errors);
     const projects = readProjects(tables.Projects, forecastStart, forecastEnd, errors);
     const resources = readResources(tables.Resources, forecastStart, forecastEnd, errors);
-    const unavail = readResourceAvailability(tables.ResourceAvailability);
+    // NEW: get unavailability both as hours map and reason events
+    const ua = readResourceUnavailability(tables.ResourceAvailability);
+    const unavail: Dict<number> = ua.hours;
+    const unavailReasonEvents: UnavailReasonEvent[] = ua.byReason;
 
     for (let i = 0; i < projects.length; i++) {
         const p = projects[i];
-        if (p.primaryId && !resourcesById[p.primaryId]) {
-            errors.push(`Projects: PrimaryResourceId "${p.primaryId}" not found among active, in-range Resources for project ${p.id} (${p.name}).`);
-        }
-        if ((p.assignType === "Exclusive-ShareOne" || p.assignType === "Exclusive-DoNotShare" || p.assignType === "Primary-ShareProportion") && !p.primaryId) {
-            errors.push(`Projects: Missing PrimaryResourceId for project ${p.id} (${p.name}) with assignment type ${p.assignType}.`);
+        if (p.primaryId && !resourcesById[p.primaryId]) errors.push(`PrimaryResourceId "${p.primaryId}" not found for project ${p.id} (${p.name}).`);
+        if (!p.primaryId && (p.assignType === "Exclusive-DoNotShare" || p.assignType === "Exclusive-ShareOne" || p.assignType === "Primary-ShareProportion")) {
+            errors.push(`Missing PrimaryResourceId for project ${p.id} (${p.name}) with assignment type ${p.assignType}.`);
         }
     }
     if (errors.length) { writeValidationErrors(workbook, errors); return; }
 
-    // Per-day availability per resource (strictly within forecast range)
+    /////////////////////// Availability ///////////////////////
+
     const dateKeys: string[] = [];
-    const perDayAvail: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+    const perDayAvail: Dict<Dict<number>> = {};
     const daysAll = rangeDays(forecastStart, forecastEnd);
+
     for (let i = 0; i < daysAll.length; i++) {
         const d = daysAll[i];
         const key = fmtYMD(d);
         dateKeys.push(key);
         const calHours = cal[key] ?? dailyHours!;
-        const dayAvail: Dict<number> = {} as Dict<number>;
+        const dayAvail: Dict<number> = {};
         for (let j = 0; j < resources.length; j++) {
             const r = resources[j];
             if (!isBetween(d, r.start, r.end)) continue;
             const dayBase = Math.min(calHours, dailyHours!);
-            const ua = unavail[`${r.id}|${key}`] ?? 0;
-            const avail = Math.max(0, dayBase - ua);
+            const uaHours = unavail[`${r.id}|${key}`] ?? 0;
+            const avail = Math.max(0, dayBase - uaHours);
             dayAvail[r.id] = avail;
         }
         perDayAvail[key] = dayAvail;
     }
 
-    const totalAvailByDate: Dict<number> = {} as Dict<number>;
+    const totalAvailByDate: Dict<number> = {};
     for (let i = 0; i < dateKeys.length; i++) {
         const dk = dateKeys[i];
         const ids = Object.keys(perDayAvail[dk] ?? {});
-        let s = 0;
-        for (let j = 0; j < ids.length; j++) s += perDayAvail[dk][ids[j]] ?? 0;
+        let s = 0; for (let j = 0; j < ids.length; j++) s += perDayAvail[dk][ids[j]] ?? 0;
         totalAvailByDate[dk] = s;
     }
 
-    // Pools
-    const projectPools: Dict<ProjectRemaining> = {} as Dict<ProjectRemaining>;
+    /////////////////////// Pools ///////////////////////
+
+    const projectPools: Dict<ProjectRemaining> = {};
     for (let i = 0; i < projects.length; i++) {
         const p = projects[i];
-        projectPools[p.key] = { totalRemaining: (p.distMethod === "Recurring Monthly") ? 0 : p.remaining, monthlyRemaining: {} as Dict<number> };
+        projectPools[p.key] = { totalRemaining: (p.distMethod === "Recurring Monthly") ? 0 : p.remaining, monthlyRemaining: {} };
     }
 
-    // Months
-    function monthsBetween(aStart: Date, aEnd: Date): Date[] {
+    const monthsBetween = (aStart: Date, aEnd: Date): Date[] => {
         let m = new Date(aStart.getFullYear(), aStart.getMonth(), 1);
         const e = new Date(aEnd.getFullYear(), aEnd.getMonth(), 1);
         const out: Date[] = [];
         while (m.getTime() <= e.getTime()) { out.push(new Date(m)); m = new Date(m.getFullYear(), m.getMonth() + 1, 1); }
         return out;
-    }
-    function monthOverlaps(mStart: Date, pStart: Date, pEnd: Date): boolean {
+    };
+    const monthsOverlap = (mStart: Date, pStart: Date, pEnd: Date): boolean => {
         const mEnd = lastOfMonth(mStart);
         return !(mEnd.getTime() < pStart.getTime() || mStart.getTime() > pEnd.getTime());
-    }
+    };
 
-    // Build monthlyRemaining for RM & soft monthly targets for Standard
-    const softMonthTarget: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+    // Build monthlyRemaining for RM and soft targets for Standard
+    const softMonthTarget: Dict<Dict<number>> = {};
     for (let ip = 0; ip < projects.length; ip++) {
         const p = projects[ip];
-        softMonthTarget[p.key] = {} as Dict<number>;
-        const months = monthsBetween(forecastStart, forecastEnd).filter((ms: Date): boolean => monthOverlaps(ms, p.start, p.end));
+        softMonthTarget[p.key] = {};
+        const months = monthsBetween(forecastStart, forecastEnd).filter(ms => monthsOverlap(ms, p.start, p.end));
         if (months.length === 0) continue;
 
-        const total = quantizeDown(p.remaining);
-        if (total < QUANTUM) continue;
-
-        const base = quantizeDown(total / months.length);
-        let used = base * months.length;
-        let rem = quantizeDown(total - used);
-
-        for (let i = 0; i < months.length; i++) {
-            const mk = monthKey(months[i]);
-            let share = base;
-            if (rem >= QUANTUM) { share += QUANTUM; rem = quantizeDown(rem - QUANTUM); }
-            softMonthTarget[p.key][mk] = share;
-            if (p.distMethod === "Recurring Monthly") projectPools[p.key].monthlyRemaining[mk] = share;
+        if (p.distMethod === "Recurring Monthly") {
+            const monthlyShare = quantizeDown(p.remaining);
+            if (monthlyShare < QUANTUM) continue;
+            for (let i = 0; i < months.length; i++) {
+                const mk = monthKey(months[i]);
+                projectPools[p.key].monthlyRemaining[mk] = monthlyShare; // lapsing month pool
+                softMonthTarget[p.key][mk] = monthlyShare;
+            }
+        } else {
+            const total = quantizeDown(p.remaining);
+            if (total < QUANTUM) continue;
+            const base = quantizeDown(total / months.length);
+            let used = base * months.length;
+            let rem = quantizeDown(total - used);
+            for (let i = 0; i < months.length; i++) {
+                const mk = monthKey(months[i]);
+                let share = base;
+                if (rem >= QUANTUM) { share += QUANTUM; rem = quantizeDown(rem - QUANTUM); }
+                softMonthTarget[p.key][mk] = share;
+            }
         }
     }
 
-    // Per-day soft caps per project-month (Standard clamped to MAX_STD_DAILY)
-    const dailySoftCap: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+    // Daily soft cap per project-day
+    const dailySoftCap: Dict<Dict<number>> = {};
     for (let ip = 0; ip < projects.length; ip++) {
         const p = projects[ip];
-        dailySoftCap[p.key] = {} as Dict<number>;
-        const months = monthsBetween(forecastStart, forecastEnd).filter((ms: Date): boolean => monthOverlaps(ms, p.start, p.end));
+        dailySoftCap[p.key] = {};
+        const months = monthsBetween(forecastStart, forecastEnd).filter(ms => monthsOverlap(ms, p.start, p.end));
         for (let im = 0; im < months.length; im++) {
             const ms = months[im];
             const mk = monthKey(ms);
-            const targetMonth: number =
-                (p.distMethod === "Recurring Monthly")
-                    ? (projectPools[p.key].monthlyRemaining[mk] ?? 0)
-                    : (softMonthTarget[p.key][mk] ?? 0);
+            const targetMonth = (p.distMethod === "Recurring Monthly")
+                ? (projectPools[p.key].monthlyRemaining[mk] ?? 0)
+                : (softMonthTarget[p.key][mk] ?? 0);
 
             const mStart = firstOfMonth(ms), mEnd = lastOfMonth(ms);
             const days = rangeDays(mStart, mEnd)
-                .filter((d: Date): boolean => isBetween(d, p.start, p.end) && isBetween(d, forecastStart, forecastEnd))
-                .filter((d: Date): boolean => (totalAvailByDate[fmtYMD(d)] ?? 0) >= QUANTUM);
+                .filter(d => isBetween(d, p.start, p.end) && isBetween(d, forecastStart, forecastEnd))
+                .filter(d => (totalAvailByDate[fmtYMD(d)] ?? 0) >= QUANTUM);
 
             if (days.length === 0 || targetMonth < QUANTUM) continue;
 
@@ -288,24 +286,29 @@ function main(workbook: ExcelScript.Workbook): void {
         }
     }
 
-    const monthAlloc: Dict<Dict<number>> = {} as Dict<Dict<number>>;
-    const weekAlloc: Dict<Dict<number>> = {} as Dict<Dict<number>>;
-    for (let i = 0; i < projects.length; i++) { monthAlloc[projects[i].key] = {} as Dict<number>; weekAlloc[projects[i].key] = {} as Dict<number>; }
+    /////////////////////// Accumulators ///////////////////////
+
+    const monthAlloc: Dict<Dict<number>> = {};
+    const weekAlloc: Dict<Dict<number>> = {};
+    for (let i = 0; i < projects.length; i++) { monthAlloc[projects[i].key] = {}; weekAlloc[projects[i].key] = {}; }
 
     const resAlloc: ResAlloc[] = [];
     const proAlloc: ProAlloc[] = [];
-    const assignedPerDay: Dict<Dict<number>> = {} as Dict<Dict<number>>;
-    const projDayAssigned: Dict<Dict<number>> = {} as Dict<Dict<number>>;
-    for (let i = 0; i < dateKeys.length; i++) assignedPerDay[dateKeys[i]] = {} as Dict<number>;
-    for (let ip = 0; ip < projects.length; ip++) projDayAssigned[projects[ip].key] = {} as Dict<number>;
-    const getAssignedMap = (dk: string): Dict<number> => { if (!assignedPerDay[dk]) assignedPerDay[dk] = {} as Dict<number>; return assignedPerDay[dk]; };
+    const assignedPerDay: Dict<Dict<number>> = {};
+    const projDayAssigned: Dict<Dict<number>> = {};
+    const dateKeysAll = rangeDays(forecastStart, forecastEnd).map(d => fmtYMD(d));
+    for (let i = 0; i < dateKeysAll.length; i++) assignedPerDay[dateKeysAll[i]] = {};
+    for (let ip = 0; ip < projects.length; ip++) projDayAssigned[projects[ip].key] = {};
+    const getAssignedMap = (dk: string): Dict<number> => { if (!assignedPerDay[dk]) assignedPerDay[dk] = {}; return assignedPerDay[dk]; };
 
     const MIN_MONTHLY_SHARE = config.minMonthlyShare ?? QUANTUM;
     const MIN_WEEKLY_SHARE = config.minWeeklyShare ?? QUANTUM;
     const EOL_WINDOW_DAYS = config.eolWindowDays ?? 21;
     const EOL_MAX_BOOST = config.eolMaxBoost ?? 3;
 
-    function pushAlloc(p: ProjectRow, r: ResourceRow, d: Date, grant: number, note: string): void {
+    /////////////////////// Helpers ///////////////////////
+
+    const pushAlloc = (p: ProjectRow, r: ResourceRow, d: Date, grant: number, note: string): void => {
         const dk = fmtYMD(d);
         const mk = monthKey(d);
         const wk = weekKey(d);
@@ -318,15 +321,16 @@ function main(workbook: ExcelScript.Workbook): void {
 
         monthAlloc[p.key][mk] = (monthAlloc[p.key][mk] ?? 0) + grant;
         weekAlloc[p.key][wk] = (weekAlloc[p.key][wk] ?? 0) + grant;
-    }
+    };
 
-    function assignHours(p: ProjectRow, r: ResourceRow, d: Date, hoursRequested: number, note: string, ignoreSoftCap?: boolean): number {
+    const assignHours = (p: ProjectRow, r: ResourceRow, d: Date, hoursRequested: number, note: string, ignoreSoftCap?: boolean): number => {
         if (hoursRequested <= 0) return 0;
         if (p.assignType === "Exclusive-DoNotShare" && r.id !== p.primaryId) return 0;
         if (!isBetween(d, forecastStart, forecastEnd)) return 0;
 
         const dk = fmtYMD(d);
         const mk = monthKey(d);
+
         const dayCap = (perDayAvail[dk]?.[r.id] ?? 0);
         const already = getAssignedMap(dk)[r.id] ?? 0;
         let room = Math.max(0, dayCap - already);
@@ -355,13 +359,18 @@ function main(workbook: ExcelScript.Workbook): void {
 
         pushAlloc(p, r, d, grant, note);
         return grant;
-    }
+    };
 
-    function monthsOverlap(mStart: Date, pStart: Date, pEnd: Date): boolean {
-        const mEnd = lastOfMonth(mStart);
-        return !(mEnd.getTime() < pStart.getTime() || mStart.getTime() > pEnd.getTime());
-    }
-    function firstWorkingDayForResourceInMonth(r: ResourceRow, monthAnyDay: Date): Date | null {
+    const anyWorkingDayForResourceInMonth = (r: ResourceRow, monthAnyDay: Date, p: ProjectRow): boolean => {
+        const days = rangeDays(firstOfMonth(monthAnyDay), lastOfMonth(monthAnyDay));
+        for (let i = 0; i < days.length; i++) {
+            const d = days[i];
+            if (isBetween(d, r.start, r.end) && isBetween(d, p.start, p.end) && isBetween(d, forecastStart, forecastEnd)) return true;
+        }
+               return false;
+    };
+
+    const firstWorkingDayForResourceInMonth = (r: ResourceRow, monthAnyDay: Date): Date | null => {
         const start = firstOfMonth(monthAnyDay), end = lastOfMonth(monthAnyDay), days = rangeDays(start, end);
         for (let i = 0; i < days.length; i++) {
             const d = days[i];
@@ -372,90 +381,150 @@ function main(workbook: ExcelScript.Workbook): void {
             if (room >= QUANTUM) return d;
         }
         return null;
-    }
-    function anyWorkingDayForResourceInMonth(r: ResourceRow, monthAnyDay: Date, p: ProjectRow): boolean {
-        const days = rangeDays(firstOfMonth(monthAnyDay), lastOfMonth(monthAnyDay));
-        for (let i = 0; i < days.length; i++) { const d = days[i]; if (isBetween(d, r.start, r.end) && isBetween(d, p.start, p.end) && isBetween(d, forecastStart, forecastEnd)) return true; }
-        return false;
-    }
-    function daysToEnd(p: ProjectRow, d: Date): number { return Math.floor((p.end.getTime() - d.getTime()) / 86400000); }
-    function eolBoost(p: ProjectRow, d: Date): number {
-        const rem = daysToEnd(p, d);
-        if (rem > EOL_WINDOW_DAYS) return 1;
-        const frac = Math.max(0, (EOL_WINDOW_DAYS - Math.max(0, rem)) / Math.max(1, EOL_WINDOW_DAYS));
-        return 1 + (EOL_MAX_BOOST - 1) * frac;
-    }
-    function needsMonthlyFloor(p: ProjectRow, d: Date): boolean {
-        const mk = monthKey(d);
-        const got = monthAlloc[p.key][mk] ?? 0;
-        const left = (p.distMethod === "Recurring Monthly") ? (projectPools[p.key].monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
-        return got + EPS < MIN_MONTHLY_SHARE && left >= QUANTUM;
-    }
-    function needsWeeklyNudge(p: ProjectRow, d: Date): boolean {
-        const wk = weekKey(d), got = weekAlloc[p.key][wk] ?? 0;
-        const mk = monthKey(d);
-        const left = (p.distMethod === "Recurring Monthly") ? (projectPools[p.key].monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
-        return (MIN_WEEKLY_SHARE > 0) && got + EPS < MIN_WEEKLY_SHARE && left >= QUANTUM;
-    }
+    };
 
-    // ===== Resource-first pass: RM EDNS, then RM ES1 (as in your last build) =====
+    const daysToEnd = (p: ProjectRow, d: Date): number => Math.floor((p.end.getTime() - d.getTime()) / 86400000);
+    const eolBoost = (p: ProjectRow, d: Date): number => {
+        const rem = daysToEnd(p, d);
+        if (rem > (config.eolWindowDays ?? 21)) return 1;
+        const EOL_WINDOW = config.eolWindowDays ?? 21;
+        const EOL_MAX = config.eolMaxBoost ?? 3;
+        const frac = Math.max(0, (EOL_WINDOW - Math.max(0, rem)) / Math.max(1, EOL_WINDOW));
+        return 1 + (EOL_MAX - 1) * frac;
+    };
+
+    /////////////////////// ES1 single-assignee cache ///////////////////////
+
+    const es1AssigneeByMonth: Dict<string> = {}; // key: ProjectKey|YYYY-MM -> ResourceId
+
+    const primaryHasAnyWorkableDayInMonth = (p: ProjectRow, mStart: Date): boolean => {
+        const primary = p.primaryId ? resourcesById[p.primaryId] : undefined;
+        if (!primary) return false;
+        const days = rangeDays(mStart, lastOfMonth(mStart));
+        for (let i = 0; i < days.length; i++) {
+            const d = days[i];
+            if (!isBetween(d, forecastStart, forecastEnd) || !isBetween(d, p.start, p.end) || !isBetween(d, primary.start, primary.end)) continue;
+            const dk = fmtYMD(d);
+            const room = Math.max(0, (perDayAvail[dk]?.[primary.id] ?? 0) - (getAssignedMap(dk)[primary.id] ?? 0));
+            if (room >= QUANTUM) return true;
+        }
+        return false;
+    };
+
+    const getEs1Assignee = (p: ProjectRow, mStart: Date): ResourceRow | null => {
+        const mk = monthKey(mStart);
+        const key = `${p.key}|${mk}`;
+        const cached = es1AssigneeByMonth[key];
+        if (cached) return resourcesById[cached] ?? null;
+
+        if (primaryHasAnyWorkableDayInMonth(p, mStart)) {
+            es1AssigneeByMonth[key] = p.primaryId;
+            return resourcesById[p.primaryId] ?? null;
+        }
+
+        // choose ONE alternate (least-loaded in month) with any workable day
+        const monthDays = rangeDays(mStart, lastOfMonth(mStart));
+        const monthResTotals: Dict<number> = {};
+        for (let di = 0; di < monthDays.length; di++) {
+            const dk = fmtYMD(monthDays[di]);
+            const ids = Object.keys(perDayAvail[dk] ?? {});
+            for (let j = 0; j < ids.length; j++) {
+                const rid = ids[j];
+                monthResTotals[rid] = (monthResTotals[rid] ?? 0) + (assignedPerDay[dk]?.[rid] ?? 0);
+            }
+        }
+        const candidate = resources
+            .filter(r => anyWorkingDayForResourceInMonth(r, mStart, p))
+            .sort((a, b) => (monthResTotals[a.id] ?? 0) - (monthResTotals[b.id] ?? 0))[0];
+
+        if (!candidate) return null;
+        es1AssigneeByMonth[key] = candidate.id;
+        return candidate;
+    };
+
+    /////////////////////// RM Month Passes (EDNS, then ES1) — FULL MONTH FILL ///////////////////////
+
     const monthsSeq = monthsBetween(forecastStart, forecastEnd);
+
+    // A) RM EDNS
     for (let im = 0; im < monthsSeq.length; im++) {
         const mStart = monthsSeq[im];
         const mk = monthKey(mStart);
-        for (let ir = 0; ir < resources.length; ir++) {
-            const r = resources[ir];
-            const fdRes = firstWorkingDayForResourceInMonth(r, mStart);
-            if (!fdRes) continue;
+        const mDays = rangeDays(mStart, lastOfMonth(mStart));
+        const rmEdns = projects.filter(p =>
+            p.distMethod === "Recurring Monthly" && p.assignType === "Exclusive-DoNotShare" && monthsOverlap(mStart, p.start, p.end)
+        );
+        for (let i = 0; i < rmEdns.length; i++) {
+            const p = rmEdns[i];
+            const primary = p.primaryId ? resourcesById[p.primaryId] : undefined;
+            if (!primary) continue;
 
-            const listRM_EDNS = projects.filter((p: ProjectRow): boolean =>
-                p.distMethod === "Recurring Monthly" && p.assignType === "Exclusive-DoNotShare" && p.primaryId === r.id && monthsOverlap(mStart, p.start, p.end)
-            );
-            for (let i = 0; i < listRM_EDNS.length; i++) {
-                const p = listRM_EDNS[i]; if (!isBetween(fdRes, p.start, p.end)) continue;
-                const pool = projectPools[p.key].monthlyRemaining[mk] ?? 0;
-                const ask = quantizeDown(pool);
-                if (ask >= QUANTUM) assignHours(p, r, fdRes, ask, "RM EDNS (resource-first, first day)", true);
-            }
+            if (!primaryHasAnyWorkableDayInMonth(p, mStart)) continue;
 
-            const listRM_ES1 = projects.filter((p: ProjectRow): boolean =>
-                p.distMethod === "Recurring Monthly" && p.assignType === "Exclusive-ShareOne" && p.primaryId === r.id && monthsOverlap(mStart, p.start, p.end)
-            );
-            for (let i = 0; i < listRM_ES1.length; i++) {
-                const p = listRM_ES1[i]; if (!isBetween(fdRes, p.start, p.end)) continue;
-                const pool = projectPools[p.key].monthlyRemaining[mk] ?? 0;
-                const ask = quantizeDown(pool);
-                if (ask >= QUANTUM) assignHours(p, r, fdRes, ask, "RM Exclusive-ShareOne (resource-first, first day)", true);
+            let left = quantizeDown(projectPools[p.key].monthlyRemaining[mk] ?? 0);
+            if (left < QUANTUM) continue;
+
+            for (let idy = 0; idy < mDays.length && left >= QUANTUM; idy++) {
+                const d = mDays[idy];
+                if (!isBetween(d, p.start, p.end) || !isBetween(d, primary.start, primary.end) || !isBetween(d, forecastStart, forecastEnd)) continue;
+                const given = assignHours(p, primary, d, left, "RM EDNS (month fill)", /*ignoreSoftCap*/ true);
+                left = quantizeDown(left - given);
             }
         }
     }
 
-    // ===== Standard EDNS & ES1 month-first passes, seeding, PSP, daily borrowing (unchanged core) =====
-    monthsSeq.forEach((mStart: Date): void => {
-        const listA = projects.filter((pp: ProjectRow): boolean => pp.assignType === "Exclusive-DoNotShare" && pp.distMethod === "Standard");
-        listA.forEach((p: ProjectRow): void => {
+    // B) RM ES1
+    for (let im = 0; im < monthsSeq.length; im++) {
+        const mStart = monthsSeq[im];
+        const mk = monthKey(mStart);
+        const mDays = rangeDays(mStart, lastOfMonth(mStart));
+        const rmEs1 = projects.filter(p =>
+            p.distMethod === "Recurring Monthly" && p.assignType === "Exclusive-ShareOne" && monthsOverlap(mStart, p.start, p.end)
+        );
+        for (let i = 0; i < rmEs1.length; i++) {
+            const p = rmEs1[i];
+            const assignee = getEs1Assignee(p, mStart);
+            if (!assignee) continue;
+
+            let left = quantizeDown(projectPools[p.key].monthlyRemaining[mk] ?? 0);
+            if (left < QUANTUM) continue;
+
+            for (let idy = 0; idy < mDays.length && left >= QUANTUM; idy++) {
+                const d = mDays[idy];
+                if (!isBetween(d, p.start, p.end) || !isBetween(d, assignee.start, assignee.end) || !isBetween(d, forecastStart, forecastEnd)) continue;
+                const given = assignHours(p, assignee, d, left, (assignee.id === p.primaryId) ? "RM ES1 (primary, month fill)" : "RM ES1 (alt, month fill)", /*ignoreSoftCap*/ true);
+                left = quantizeDown(left - given);
+            }
+        }
+    }
+
+    /////////////////////// Standard seeding (kept minimal) ///////////////////////
+
+    // Standard EDNS
+    monthsSeq.forEach((mStart) => {
+        const listA = projects.filter(pp => pp.assignType === "Exclusive-DoNotShare" && pp.distMethod === "Standard");
+        listA.forEach((p) => {
             if (!monthsOverlap(mStart, p.start, p.end)) return;
-            const primary = resourcesById[p.primaryId];
-            if (!primary) return;
+            const primary = resourcesById[p.primaryId]; if (!primary) return;
             const start = firstOfMonth(mStart), end = lastOfMonth(mStart);
             const days = rangeDays(start, end);
             for (let idy = 0; idy < days.length; idy++) {
                 const d = days[idy];
                 if (!isBetween(d, forecastStart, forecastEnd)) continue;
                 if (!isBetween(d, p.start, p.end) || !isBetween(d, primary.start, primary.end)) continue;
-                const pool = projectPools[p.key].totalRemaining;
-                const ask = quantizeDown(pool);
+                const ask = quantizeDown(projectPools[p.key].totalRemaining);
                 if (ask >= QUANTUM) assignHours(p, primary, d, ask, "EDNS Standard (first available day)", true);
                 break;
             }
         });
     });
 
-    monthsSeq.forEach((mStart: Date): void => {
+    // Standard ES1
+    monthsSeq.forEach((mStart) => {
         const mEnd = lastOfMonth(mStart);
         const monthDays = rangeDays(mStart, mEnd);
-        const listB = projects.filter((pp: ProjectRow): boolean => pp.assignType === "Exclusive-ShareOne" && pp.distMethod === "Standard");
-        listB.forEach((p: ProjectRow): void => {
+        const listB = projects.filter(pp => pp.assignType === "Exclusive-ShareOne" && pp.distMethod === "Standard");
+        listB.forEach((p) => {
             if (!monthsOverlap(mStart, p.start, p.end)) return;
             const primary = resourcesById[p.primaryId];
             let assigned = 0;
@@ -464,408 +533,59 @@ function main(workbook: ExcelScript.Workbook): void {
                     const fd = monthDays[idy];
                     if (!isBetween(fd, forecastStart, forecastEnd)) continue;
                     if (!isBetween(fd, res.start, res.end) || !isBetween(fd, p.start, p.end)) continue;
-                    const pool = projectPools[p.key].totalRemaining;
-                    const ask = quantizeDown(pool);
+                    const ask = quantizeDown(projectPools[p.key].totalRemaining);
                     if (ask < QUANTUM) return 0;
-                    const label = (primary && res.id === primary.id ? "Exclusive-ShareOne Standard (primary)" : "Exclusive-ShareOne Standard (reassigned)");
+                    const label = (primary && res.id === primary.id ? "ES1 Standard (primary, full remainder)" : "ES1 Standard (reassigned, full remainder)");
                     return assignHours(p, res, fd, ask, label, true);
                 }
                 return 0;
             };
             if (primary) assigned = tryAssignTo(primary);
             if (assigned <= 0) {
-                const monthResTotals: Dict<number> = {} as Dict<number>;
+                // least-loaded alt
+                const monthResTotals: Dict<number> = {};
                 for (let i = 0; i < monthDays.length; i++) {
-                    const d = monthDays[i];
-                    const dk = fmtYMD(d);
-                    const availMap = perDayAvail[dk];
-                    const ids = availMap ? Object.keys(availMap) : [];
+                    const d = monthDays[i], dk = fmtYMD(d);
+                    const ids = Object.keys(perDayAvail[dk] ?? {});
                     for (let j = 0; j < ids.length; j++) {
                         const rid = ids[j];
-                        const prevTot = monthResTotals[rid] ?? 0;
-                        const got = (assignedPerDay[dk]?.[rid] ?? 0);
-                        monthResTotals[rid] = prevTot + got;
+                        monthResTotals[rid] = (monthResTotals[rid] ?? 0) + (assignedPerDay[dk]?.[rid] ?? 0);
                     }
                 }
                 const candidates = resources
-                    .filter((r: ResourceRow): boolean => anyWorkingDayForResourceInMonth(r, mStart, p))
-                    .sort((a: ResourceRow, b: ResourceRow): number => (monthResTotals[a.id] ?? 0) - (monthResTotals[b.id] ?? 0));
+                    .filter(r => anyWorkingDayForResourceInMonth(r, mStart, p))
+                    .sort((a, b) => (monthResTotals[a.id] ?? 0) - (monthResTotals[b.id] ?? 0));
                 for (let i = 0; i < candidates.length; i++) { assigned = tryAssignTo(candidates[i]); if (assigned > 0) break; }
             }
         });
     });
 
-    // Monthly seed
-    monthsSeq.forEach((mStart: Date): void => {
-        const mk = monthKey(mStart);
-        const mEnd = lastOfMonth(mStart);
-        const days = rangeDays(mStart, mEnd);
-
-        const findSeedSlot = (p: ProjectRow): { r: ResourceRow; d: Date } | null => {
-            const primary = (p.primaryId && resourcesById[p.primaryId]) ? resourcesById[p.primaryId] : null;
-            if (p.assignType === "Exclusive-DoNotShare") {
-                if (!primary) return null;
-                for (let idy = 0; idy < days.length; idy++) {
-                    const d = days[idy]; if (!isBetween(d, p.start, p.end) || !isBetween(d, forecastStart, forecastEnd)) continue;
-                    if (!isBetween(d, primary.start, primary.end)) continue;
-                    const dk = fmtYMD(d);
-                    const room = Math.max(0, (perDayAvail[dk]?.[primary.id] ?? 0) - (getAssignedMap(dk)[primary.id] ?? 0));
-                    if (room >= QUANTUM) return { r: primary, d };
-                }
-                return null;
-            }
-            if (primary) {
-                for (let idy = 0; idy < days.length; idy++) {
-                    const d = days[idy]; if (!isBetween(d, p.start, p.end) || !isBetween(d, forecastStart, forecastEnd)) continue;
-                    if (!isBetween(d, primary.start, primary.end)) continue;
-                    const dk = fmtYMD(d);
-                    const room = Math.max(0, (perDayAvail[dk]?.[primary.id] ?? 0) - (getAssignedMap(dk)[primary.id] ?? 0));
-                    if (room >= QUANTUM) return { r: primary, d };
-                }
-            }
-            for (let idy = 0; idy < days.length; idy++) {
-                const d = days[idy]; if (!isBetween(d, p.start, p.end) || !isBetween(d, forecastStart, forecastEnd)) continue;
-                const dk = fmtYMD(d);
-                for (let ir = 0; ir < resources.length; ir++) {
-                    const r = resources[ir]; if (!isBetween(d, r.start, r.end)) continue;
-                    const room = Math.max(0, (perDayAvail[dk]?.[r.id] ?? 0) - (getAssignedMap(dk)[r.id] ?? 0));
-                    if (room >= QUANTUM) return { r, d };
-                }
-            }
-            return null;
-        };
-
-        for (let ip = 0; ip < projects.length; ip++) {
-            const p = projects[ip];
-            if (!monthsOverlap(mStart, p.start, p.end)) continue;
-            const pools = projectPools[p.key];
-            const left = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
-            if (left < QUANTUM) continue;
-            const got = monthAlloc[p.key][mk] ?? 0;
-            if (got + EPS >= MIN_MONTHLY_SHARE) continue;
-            const slot = findSeedSlot(p);
-            if (slot) assignHours(p, slot.r, slot.d, QUANTUM, "Monthly seed");
-        }
-    });
-
-    // PSP pass (unchanged)
-    const listC = projects.filter((pp: ProjectRow): boolean => pp.assignType === "Primary-ShareProportion");
-    listC.forEach((p: ProjectRow): void => {
-        const primary = resourcesById[p.primaryId];
-        if (!primary) return;
-        monthsSeq.forEach((mStart: Date): void => {
-            if (!monthsOverlap(mStart, p.start, p.end)) return;
-            const mEnd = lastOfMonth(mStart);
-            const monthDays2 = rangeDays(mStart, mEnd).filter((d: Date): boolean => isBetween(d, p.start, p.end) && isBetween(d, forecastStart, forecastEnd));
-            for (let i = 0; i < monthDays2.length; i++) {
-                const d = monthDays2[i];
-                const mk = monthKey(d);
-                const pools = projectPools[p.key];
-                const remaining = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : pools.totalRemaining;
-                if (remaining < QUANTUM) continue;
-                const dk = fmtYMD(d);
-                const dayRoom = Math.max(0, (perDayAvail[dk]?.[primary.id] ?? 0) - (getAssignedMap(dk)[primary.id] ?? 0));
-                if (dayRoom < QUANTUM) continue;
-
-                let remainingDays = 0;
-                for (let j = 0; j < monthDays2.length; j++) {
-                    const dd = monthDays2[j];
-                    const ddk = fmtYMD(dd);
-                    const room = Math.max(0, (perDayAvail[ddk]?.[primary.id] ?? 0) - (getAssignedMap(ddk)[primary.id] ?? 0));
-                    if (room >= QUANTUM) remainingDays++;
-                }
-                const rawTarget = Math.max(0, Math.min(dayRoom, Math.ceil(remaining / Math.max(1, remainingDays))));
-                const target = quantizeDown(rawTarget);
-                if (target >= QUANTUM) assignHours(p, primary, d, target, "Primary-ShareProportion (primary)");
-            }
-        });
-    });
-
-    // Daily borrowing (unchanged)
-    for (let di = 0; di < daysAll.length; di++) {
-        const d = daysAll[di];
-        const dk = fmtYMD(d);
-        const mkToday = monthKey(d);
-
-        const needy = resources
-            .filter((r: ResourceRow): boolean => isBetween(d, r.start, r.end))
-            .map((r: ResourceRow): { r: ResourceRow; room: number } => {
-                const cap = perDayAvail[dk]?.[r.id] ?? 0;
-                const got = getAssignedMap(dk)[r.id] ?? 0;
-                return { r, room: Math.max(0, cap - got) };
-            })
-            .filter((x: { r: ResourceRow; room: number }): boolean => x.room >= QUANTUM)
-            .sort((a, b): number => b.room - a.room);
-
-        if (needy.length === 0) continue;
-
-        const candListBase = projects.filter((p: ProjectRow): boolean => isBetween(d, p.start, p.end));
-        const baseCandidates: Cand[] = candListBase
-            .map((p: ProjectRow): Cand => {
-                const pools = projectPools[p.key];
-                const left = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mkToday] ?? 0) : projectPools[p.key].totalRemaining;
-                const needMonth = needsMonthlyFloor(p, d) ? 1 : 0;
-                const needWeek = needsWeeklyNudge(p, d) ? 1 : 0;
-                const boost = eolBoost(p, d);
-                return { p, left, prioKey: [needMonth, needWeek, boost, left] };
-            })
-            .filter((c: Cand): boolean => c.left >= QUANTUM);
-
-        for (let ni = 0; ni < needy.length; ni++) {
-            const need = needy[ni];
-            if (need.room < QUANTUM) continue;
-
-            const sorted = (list: Cand[]): Cand[] =>
-                list
-                    .filter((c: Cand): boolean => c.p.assignType !== "Exclusive-DoNotShare" && c.left >= QUANTUM)
-                    .sort((a: Cand, b: Cand): number => {
-                        for (let i = 0; i < 4; i++) { if (b.prioKey[i] !== a.prioKey[i]) return b.prioKey[i] - a.prioKey[i]; }
-                        return 0;
-                    })
-                    .map((c: Cand): Cand => ({ p: c.p, left: c.left, prioKey: c.prioKey }));
-
-            // RR for Standard
-            let stdCandidates = sorted(baseCandidates.filter((c: Cand): boolean => c.p.distMethod === "Standard"));
-            let rrRounds = 0;
-            const MAX_RR_ROUNDS = 96;
-            while (need.room >= QUANTUM - EPS && stdCandidates.length > 0 && rrRounds < MAX_RR_ROUNDS) {
-                rrRounds++;
-                let anyGivenRR = false;
-                for (let ci = 0; ci < stdCandidates.length; ci++) {
-                    if (need.room < QUANTUM - EPS) break;
-                    const cand = stdCandidates[ci];
-                    if (cand.left < QUANTUM) continue;
-
-                    const noteParts: string[] = [];
-                    if (cand.prioKey[0]) noteParts.push("Monthly-share");
-                    if (cand.prioKey[1]) noteParts.push("Weekly-nudge");
-                    if (cand.prioKey[2] > 1) noteParts.push("EOL-priority");
-                    const note = ["Borrowing / RR-Standard", ...noteParts].join(" / ");
-
-                    const given = assignHours(cand.p, need.r, d, QUANTUM, note);
-                    if (given >= QUANTUM - EPS) {
-                        cand.left -= given;
-                        need.room -= given;
-                        anyGivenRR = true;
-                    }
-                }
-                stdCandidates = stdCandidates.filter((c: Cand): boolean => c.left >= QUANTUM);
-                if (!anyGivenRR) break;
-            }
-
-            if (need.room < QUANTUM - EPS) continue;
-
-            // Fallback spread
-            let candidates = sorted(baseCandidates);
-            if (candidates.length === 0) continue;
-
-            const MAX_ROUNDS = 32;
-            let rounds = 0;
-            while (need.room >= QUANTUM - EPS && candidates.length > 0 && rounds < MAX_ROUNDS) {
-                rounds++;
-                const rawShare = need.room / candidates.length;
-                const perShare = Math.max(QUANTUM, quantizeDown(rawShare));
-                let anyGiven = false;
-
-                for (let ci = 0; ci < candidates.length; ci++) {
-                    if (need.room < QUANTUM - EPS) break;
-                    const cand = candidates[ci];
-
-                    const noteParts: string[] = [];
-                    if (cand.prioKey[0]) noteParts.push("Monthly-share");
-                    if (cand.prioKey[1]) noteParts.push("Weekly-nudge");
-                    if (cand.prioKey[2] > 1) noteParts.push("EOL-priority");
-                    const note = ["Borrowing", ...noteParts].join(" / ");
-
-                    const ask = quantizeDown(Math.min(perShare, cand.left, need.room));
-                    if (ask < QUANTUM) continue;
-
-                    const given = assignHours(cand.p, need.r, d, ask, note);
-                    if (given >= QUANTUM - EPS) {
-                        cand.left -= given;
-                        need.room -= given;
-                        anyGiven = true;
-                    }
-                }
-                candidates = candidates.filter((c: Cand): boolean => c.left >= QUANTUM);
-
-                if (!anyGiven) {
-                    for (let ci = 0; ci < candidates.length; ci++) {
-                        if (need.room < QUANTUM - EPS) break;
-                        const cand = candidates[ci];
-                        const given = assignHours(cand.p, need.r, d, QUANTUM, "Borrowing / quantum");
-                        if (given >= QUANTUM - EPS) { cand.left -= given; need.room -= given; anyGiven = true; }
-                    }
-                    candidates = candidates.filter((c: Cand): boolean => c.left >= QUANTUM);
-                }
-                if (!anyGiven) break;
-            }
-        }
-    }
-
-    // Month-end floor top-up (unchanged)
-    monthsSeq.forEach((mStart: Date): void => {
-        const mEnd = lastOfMonth(mStart);
-        const mk = monthKey(mStart);
-        const monthDays = rangeDays(mStart, mEnd);
-
-        for (let ip = 0; ip < projects.length; ip++) {
-            const p = projects[ip];
-            if (!monthsOverlap(mStart, p.start, p.end)) continue;
-            const got = monthAlloc[p.key][mk] ?? 0;
-            if (got + EPS >= MIN_MONTHLY_SHARE) continue;
-
-            const pools = projectPools[p.key];
-            let left = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : projectPools[p.key].totalRemaining;
-            if (left < QUANTUM) continue;
-
-            let remainingNeed = quantizeDown(Math.min(MIN_MONTHLY_SHARE - got, left));
-            if (remainingNeed < QUANTUM) continue;
-
-            const tryDays = monthDays.filter((d: Date): boolean => isBetween(d, p.start, p.end) && isBetween(d, forecastStart, forecastEnd));
-            const primary = resourcesById[p.primaryId];
-
-            const tryAssign = (resList: ResourceRow[], label: string): void => {
-                for (let idy = 0; idy < tryDays.length; idy++) {
-                    const d = tryDays[idy];
-                    if (remainingNeed < QUANTUM) break;
-                    for (let ir = 0; ir < resList.length; ir++) {
-                        const r = resList[ir];
-                        if (!isBetween(d, r.start, r.end)) continue;
-                        const given = assignHours(p, r, d, remainingNeed, `Monthly floor top-up (${label})`, true);
-                        remainingNeed = quantizeDown(remainingNeed - given);
-                        if (remainingNeed < QUANTUM) break;
-                    }
-                }
-            };
-
-            if (primary) tryAssign([primary], "primary");
-            if (remainingNeed >= QUANTUM && p.assignType !== "Exclusive-DoNotShare") tryAssign(resources, "any");
-        }
-    });
-
-    // ===== PASS F: Monthly 100% utilization top-up (new) =====
-    // For each month and resource, fill any remaining daily room (0.5h RR) using:
-    // 1) RM pools of that month first (EDNS only primary), then 2) Standard pools.
-    monthsSeq.forEach((mStart: Date): void => {
-        const mk = monthKey(mStart);
-        const mEnd = lastOfMonth(mStart);
-        const days = rangeDays(mStart, mEnd);
-
-        for (let ir = 0; ir < resources.length; ir++) {
-            const r = resources[ir];
-
-            for (let idy = 0; idy < days.length; idy++) {
-                const d = days[idy];
-                if (!isBetween(d, forecastStart, forecastEnd)) continue;
-                if (!isBetween(d, r.start, r.end)) continue;
-
-                const dk = fmtYMD(d);
-                let room = quantizeDown(Math.max(0, (perDayAvail[dk]?.[r.id] ?? 0) - (getAssignedMap(dk)[r.id] ?? 0)));
-                if (room < QUANTUM) continue;
-
-                // Build RM candidates for this day
-                let rmCands: ProjectRow[] = projects.filter((p: ProjectRow): boolean =>
-                    p.distMethod === "Recurring Monthly" &&
-                    monthsOverlap(mStart, p.start, p.end) &&
-                    isBetween(d, p.start, p.end) &&
-                    (projectPools[p.key].monthlyRemaining[mk] ?? 0) >= QUANTUM &&
-                    (p.assignType !== "Exclusive-DoNotShare" || p.primaryId === r.id)
-                );
-
-                // Prioritize EDNS primary first, then others, then by eol/left
-                rmCands = rmCands.sort((a: ProjectRow, b: ProjectRow): number => {
-                    const aEd = (a.assignType === "Exclusive-DoNotShare" && a.primaryId === r.id) ? 1 : 0;
-                    const bEd = (b.assignType === "Exclusive-DoNotShare" && b.primaryId === r.id) ? 1 : 0;
-                    if (bEd !== aEd) return bEd - aEd;
-                    const eb = eolBoost(b, d) - eolBoost(a, d);
-                    if (Math.abs(eb) > 1e-9) return eb > 0 ? 1 : -1;
-                    const lb = (projectPools[b.key].monthlyRemaining[mk] ?? 0) - (projectPools[a.key].monthlyRemaining[mk] ?? 0);
-                    return lb > 0 ? 1 : lb < 0 ? -1 : 0;
-                });
-
-                // Round-robin 0.5 across RM first
-                let idxRR = 0;
-                while (room >= QUANTUM && rmCands.length > 0) {
-                    const p = rmCands[idxRR % rmCands.length];
-                    const given = assignHours(p, r, d, QUANTUM, "Utilization top-up (RM month)", true);
-                    if (given >= QUANTUM - EPS) {
-                        room = quantizeDown(room - given);
-                    }
-                    // Remove exhausted pools
-                    rmCands = rmCands.filter((pp: ProjectRow): boolean => (projectPools[pp.key].monthlyRemaining[mk] ?? 0) >= QUANTUM);
-                    idxRR++;
-                }
-
-                if (room < QUANTUM) continue;
-
-                // Then Standard pools (respect EDNS primary)
-                let stdCands: ProjectRow[] = projects.filter((p: ProjectRow): boolean =>
-                    p.distMethod === "Standard" &&
-                    isBetween(d, p.start, p.end) &&
-                    projectPools[p.key].totalRemaining >= QUANTUM &&
-                    (p.assignType !== "Exclusive-DoNotShare" || p.primaryId === r.id)
-                ).sort((a: ProjectRow, b: ProjectRow): number => {
-                    const eb = eolBoost(b, d) - eolBoost(a, d);
-                    if (Math.abs(eb) > 1e-9) return eb > 0 ? 1 : -1;
-                    const lb = projectPools[b.key].totalRemaining - projectPools[a.key].totalRemaining;
-                    return lb > 0 ? 1 : lb < 0 ? -1 : 0;
-                });
-
-                idxRR = 0;
-                while (room >= QUANTUM && stdCands.length > 0) {
-                    const p = stdCands[idxRR % stdCands.length];
-                    const given = assignHours(p, r, d, QUANTUM, "Utilization top-up (STD)", true);
-                    if (given >= QUANTUM - EPS) {
-                        room = quantizeDown(room - given);
-                    }
-                    stdCands = stdCands.filter((pp: ProjectRow): boolean => projectPools[pp.key].totalRemaining >= QUANTUM);
-                    idxRR++;
-                }
-            }
-        }
-    });
-
-    // ==== Outputs ====
-    const summary = buildProjectSummary(projects, resAlloc);
-
-    writeTable(workbook, "ResourceAllocation", [
-        ["ResourceId", "ResourceName", "ProjectKey", "ProjectId", "ProjectName", "Date", "Hours", "Notes"],
-        ...resAlloc.map((r: ResAlloc): (string | number)[] => [r.ResourceId, r.ResourceName, r.ProjectKey, r.ProjectId, r.ProjectName, r.Date, r.Hours, r.Notes])
-    ]);
-
-    writeTable(workbook, "ProjectAllocation", [
-        ["ProjectKey", "ProjectId", "ProjectName", "ProjectManager", "Date", "Hours", "Notes"],
-        ...proAlloc.map((p: ProAlloc): (string | number)[] => [p.ProjectKey, p.ProjectId, p.ProjectName, p.ProjectManager, p.Date, p.Hours, p.Notes])
-    ]);
-
-    writeTable(workbook, "ProjectSummary", [
-        ["ProjectKey", "ProjectId", "ProjectName", "Description", "Project Manager", "StartDate", "EndDate", "Status", "Remaining_Hours_At_Start", "Allocated_Hours", "Unallocated_Hours"],
-        ...summary
-    ]);
-
-    writeProjectGantts(workbook, "ProjectGantt", projects, proAlloc, forecastStart, forecastEnd);
-    writeResourceGantts(workbook, "ResourceGantt", resources, resAlloc, forecastStart, forecastEnd);
-    writeProjectMonthResourceGantt(workbook, "ProjectMonthResource", projects, resources, resAlloc, forecastStart, forecastEnd);
+    // Hand off to Part 2 (PSP gating + borrowing + outputs + NEW: Reason pseudo-projects)
+    continueAfterMain(
+        workbook, config, projects, resources, daysAll,
+        perDayAvail, dailySoftCap, projectPools,
+        monthAlloc, weekAlloc, resAlloc, proAlloc,
+        assignedPerDay, projDayAssigned,
+        unavailReasonEvents // NEW
+    );
 }
 
-/////////////////////// Readers & Validators ///////////////////////
+/////////////////////// Readers & Writers ///////////////////////
 
 function getTablesByName(workbook: ExcelScript.Workbook): Dict<ExcelScript.Table> {
-    const dict: Dict<ExcelScript.Table> = {} as Dict<ExcelScript.Table>;
-    workbook.getTables().forEach((t: ExcelScript.Table): void => { dict[t.getName()] = t; });
+    const dict: Dict<ExcelScript.Table> = {};
+    workbook.getTables().forEach((t) => { dict[t.getName()] = t; });
     return dict;
 }
-
 function writeValidationErrors(workbook: ExcelScript.Workbook, errors: string[]): void {
-    const ws = ensureSheet(workbook, "ValidationErrors", true);
+    const ws: ExcelScript.Worksheet = ensureSheet(workbook, "ValidationErrors", true);
     const rows: string[][] = [["Issue"], ...errors.map((e: string): string[] => [e])];
-    const range = ws.getRangeByIndexes(0, 0, rows.length, 1);
+    const range: ExcelScript.Range = ws.getRangeByIndexes(0, 0, rows.length, 1);
     range.setValues(rows);
-    formatHeader(ws.getRangeByIndexes(0, 0, 1, 1));
+    const header: ExcelScript.Range = ws.getRangeByIndexes(0, 0, 1, 1);
+    formatHeader(header);
     ws.getUsedRange()?.getFormat().autofitColumns();
 }
-
 function getBodyRows(t: ExcelScript.Table): Row[] {
     const tblRange = t.getRange();
     const allValues = tblRange.getValues() as Cell[][];
@@ -877,64 +597,47 @@ function getBodyRows(t: ExcelScript.Table): Row[] {
     for (let i = startRow; i < endRow; i++) body.push(allValues[i] as Row);
     return body;
 }
-
 function readConfigurations(t: ExcelScript.Table): Config {
-    const headers = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+    const headers = t.getHeaderRowRange().getValues()[0].map(h => String(h).trim());
     const rows = getBodyRows(t);
-    const idx: Dict<number> = {} as Dict<number>;
-    headers.forEach((h: string, i: number): void => { idx[h] = i; });
-
-    const nameIdx = idx["Name"];
-    const valIdx = idx["Value"];
-    const statusIdx = idx["Status"];
-
-    const map: Dict<string> = {} as Dict<string>;
-    rows.forEach((r: Row): void => {
-        const st = asString(r[statusIdx]);
+    const idx: Dict<number> = {};
+    headers.forEach((h, i) => { idx[h] = i; });
+    const nameIdx = idx["Name"]; const valIdx = idx["Value"]; const statusIdx = idx["Status"];
+    const raw: Dict<string> = {};
+    rows.forEach(r => {
+        const st = String(r[statusIdx] ?? "").trim();
         if (st && st.toLowerCase() !== "active") return;
-        const name = asString(r[nameIdx]);
-        const val = asString(r[valIdx]);
-        if (name) map[name] = val;
+        const name = String(r[nameIdx] ?? "").trim();
+        const val = String(r[valIdx] ?? "").trim();
+        if (name) raw[name] = val;
     });
-
-    const dailyHours = asNumber(map["Daily Available Hours"] ?? null);
-    const forecastStart = asDate(map["Forecast Start Date"] ?? null);
-    const forecastEnd = asDate(map["Forecast End Date"] ?? null);
-
-    const minMonthlyShare = asNumber(map["Min Monthly Share Hours Per Project"] ?? null) ?? undefined;
-    const minWeeklyShare = asNumber(map["Min Weekly Share Hours Per Project"] ?? null) ?? undefined;
-    const eolWindowDays = asNumber(map["End-Date Priority Window (days)"] ?? null) ?? undefined;
-    const eolMaxBoost = asNumber(map["End-Date Priority Max Boost"] ?? null) ?? undefined;
-
+    const dailyHours = asNumber(raw["Daily Available Hours"] ?? null);
+    const forecastStart = asDate(raw["Forecast Start Date"] ?? null);
+    const forecastEnd = asDate(raw["Forecast End Date"] ?? null);
+    const minMonthlyShare = asNumber(raw["Min Monthly Share Hours Per Project"] ?? null) ?? undefined;
+    const minWeeklyShare = asNumber(raw["Min Weekly Share Hours Per Project"] ?? null) ?? undefined;
+    const eolWindowDays = asNumber(raw["End-Date Priority Window (days)"] ?? null) ?? undefined;
+    const eolMaxBoost = asNumber(raw["End-Date Priority Max Boost"] ?? null) ?? undefined;
     return { dailyHours, forecastStart, forecastEnd, minMonthlyShare, minWeeklyShare, eolWindowDays, eolMaxBoost };
 }
-
 function readCalendar(t: ExcelScript.Table, start: Date, end: Date, errors: string[]): Dict<number> {
-    const headers = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+    const headers = t.getHeaderRowRange().getValues()[0].map(h => String(h).trim());
     const rows = getBodyRows(t);
-
     const dateIdx = headers.indexOf("Date");
     const availIdx = headers.indexOf("AvailableHours");
-
-    const map: Dict<number> = {} as Dict<number>;
-    rows.forEach((r: Row): void => {
+    const map: Dict<number> = {};
+    rows.forEach(r => {
         const d = asDate(r[dateIdx]);
         const ah = asNumber(r[availIdx]);
-        if (!d) { errors.push(`Calendar: invalid Date value.`); return; }
+        if (!d) { errors.push(`Calendar: invalid Date.`); return; }
         if (ah == null || ah < 0) { errors.push(`Calendar: invalid AvailableHours on ${d}.`); return; }
-        if (isBetween(d, start, end)) map[fmtYMD(d)] = ah;
+        if (d.getTime() >= start.getTime() && d.getTime() <= end.getTime()) map[fmtYMD(d)] = ah!;
     });
     return map;
 }
-
-function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
-    return !(aEnd.getTime() < bStart.getTime() || aStart.getTime() > bEnd.getTime());
-}
-
 function readProjects(t: ExcelScript.Table, fStart: Date, fEnd: Date, errors: string[]): ProjectRow[] {
-    const headers = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+    const headers = t.getHeaderRowRange().getValues()[0].map(h => String(h).trim());
     const rows = getBodyRows(t);
-
     const projectKeyIdx = headers.indexOf("ProjectKey");
     const projectIdIdx = headers.indexOf("ProjectId");
     const projectNameIdx = headers.indexOf("ProjectName");
@@ -950,93 +653,91 @@ function readProjects(t: ExcelScript.Table, fStart: Date, fEnd: Date, errors: st
     const primaryResIdIdx = headers.indexOf("PrimaryResourceId");
     const primaryResNameIdx = headers.indexOf("PrimaryResourceName");
     const assignTypeIdx = headers.indexOf("PrimaryResourceAssignmentType");
-
     const out: ProjectRow[] = [];
     for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
-
         const item: ProjectRow = {
-            key: asString(r[projectKeyIdx]),
-            id: asString(r[projectIdIdx]),
-            name: asString(r[projectNameIdx]),
-            desc: asString(r[descriptionIdx]),
-            pm: asString(r[pmIdx]),
-            total: asNumber(r[totalHoursIdx]) ?? 0,
-            prevUsed: asNumber(r[prevUsedIdx]) ?? 0,
-            remaining: asNumber(r[remainingIdx]) ?? 0,
-            start: asDate(r[startIdx]) ?? new Date("1900-01-01"),
-            end: asDate(r[endIdx]) ?? new Date("9999-12-31"),
-            status: toStatus(asString(r[statusIdx])),
-            distMethod: toDist(asString(r[distIdx])),
-            primaryId: asString(r[primaryResIdIdx]),
-            primaryName: asString(r[primaryResNameIdx]),
-            assignType: toAssign(asString(r[assignTypeIdx]))
+            key: asString(r[projectKeyIdx]), id: asString(r[projectIdIdx]), name: asString(r[projectNameIdx]),
+            desc: asString(r[descriptionIdx]), pm: asString(r[pmIdx]),
+            total: asNumber(r[totalHoursIdx]) ?? 0, prevUsed: asNumber(r[prevUsedIdx]) ?? 0, remaining: asNumber(r[remainingIdx]) ?? 0,
+            start: asDate(r[startIdx]) ?? new Date("1900-01-01"), end: asDate(r[endIdx]) ?? new Date("9999-12-31"),
+            status: (String(r[statusIdx] ?? "").trim() === "Active") ? "Active" : "Inactive",
+            distMethod: (String(r[distIdx] ?? "").trim() === "Recurring Monthly") ? "Recurring Monthly" : "Standard",
+            primaryId: asString(r[primaryResIdIdx]), primaryName: asString(r[primaryResNameIdx]),
+            assignType: ((): AssignType => {
+                const v = String(r[assignTypeIdx] ?? "").trim();
+                if (v === "Exclusive-ShareOne") return "Exclusive-ShareOne";
+                if (v === "Exclusive-DoNotShare") return "Exclusive-DoNotShare";
+                return "Primary-ShareProportion";
+            })()
         };
-
         if (!item.key || !item.id) { errors.push(`Projects: missing ProjectKey/ProjectId for row "${item.name}".`); continue; }
         if (item.remaining < 0) { errors.push(`Projects: RemainingHours cannot be negative for ${item.id}.`); continue; }
         if (item.status !== "Active") continue;
-        if (!overlaps(item.start, item.end, fStart, fEnd)) continue;
-
-        out.push(item);
+        if (!(item.end.getTime() < fStart.getTime() || item.start.getTime() > fEnd.getTime())) out.push(item);
     }
     return out;
 }
-
 function readResources(t: ExcelScript.Table, fStart: Date, fEnd: Date, errors: string[]): ResourceRow[] {
-    const headers = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+    const headers = t.getHeaderRowRange().getValues()[0].map(h => String(h).trim());
     const rows = getBodyRows(t);
-
     const resIdIdx = headers.indexOf("ResourceId");
     const resNameIdx = headers.indexOf("ResourceName");
     const roleIdx = headers.indexOf("Role");
     const startIdx = headers.indexOf("StartDate");
     const endIdx = headers.indexOf("EndDate");
     const statusIdx = headers.indexOf("Status");
-
     const out: ResourceRow[] = [];
     for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
         const item: ResourceRow = {
-            id: asString(r[resIdIdx]),
-            name: asString(r[resNameIdx]),
-            role: asString(r[roleIdx]),
-            start: asDate(r[startIdx]) ?? new Date("1900-01-01"),
-            end: asDate(r[endIdx]) ?? new Date("9999-12-31"),
-            status: toStatus(asString(r[statusIdx]))
+            id: asString(r[resIdIdx]), name: asString(r[resNameIdx]), role: asString(r[roleIdx]),
+            start: asDate(r[startIdx]) ?? new Date("1900-01-01"), end: asDate(r[endIdx]) ?? new Date("9999-12-31"),
+            status: (String(r[statusIdx] ?? "").trim() === "Active") ? "Active" : "Inactive"
         };
         if (!item.id) { errors.push(`Resources: missing ResourceId for "${item.name}".`); continue; }
         if (item.status !== "Active") continue;
-        if (!overlaps(item.start, item.end, fStart, fEnd)) continue;
-
-        out.push(item);
+        if (!(item.end.getTime() < fStart.getTime() || item.start.getTime() > fEnd.getTime())) out.push(item);
     }
-    resourcesById = {} as Dict<ResourceRow>;
-    for (let i = 0; i < out.length; i++) resourcesById[out[i].id] = out[i];
+    resourcesById = {}; for (let i = 0; i < out.length; i++) resourcesById[out[i].id] = out[i];
     return out;
 }
 
-function readResourceAvailability(t: ExcelScript.Table): Dict<number> {
-    const headers = t.getHeaderRowRange().getValues()[0].map((h: Cell) => String(h).trim());
+// NEW: read unavailability as (1) hours map for capacity math and (2) reason-tagged events for outputs
+function readResourceUnavailability(t: ExcelScript.Table): { hours: Dict<number>, byReason: UnavailReasonEvent[] } {
+    const headers = t.getHeaderRowRange().getValues()[0].map(h => String(h).trim());
     const rows = getBodyRows(t);
-
     const resIdIdx = headers.indexOf("ResourceId");
     const dateIdx = headers.indexOf("Date");
     const uaIdx = headers.indexOf("UnavailableHours");
+    const reasonIdx = headers.indexOf("Reason");
 
-    const map: Dict<number> = {} as Dict<number>;
+    const hours: Dict<number> = {};
+    const byReason: UnavailReasonEvent[] = [];
+
     for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
         const rid = asString(r[resIdIdx]);
         const d = asDate(r[dateIdx]);
         const ua = asNumber(r[uaIdx]) ?? 0;
-        if (!rid || !d) continue;
-        map[`${rid}|${fmtYMD(d)}`] = Math.max(0, ua);
-    }
-    return map;
-}
+        const reasonRaw = asString(r[reasonIdx]);
+        const reason = reasonRaw ? reasonRaw : "Unavailable";
 
-/////////////////////// Writers & Formatting ///////////////////////
+        if (!rid || !d) continue;
+        const dk = fmtYMD(d);
+        const key = `${rid}|${dk}`;
+
+        // capacity map (sum by resource-date)
+        hours[key] = Math.max(0, (hours[key] ?? 0) + Math.max(0, ua));
+
+        // reason events (one row each; skip zero/negative)
+        const eff = Math.max(0, ua);
+        if (eff > 0) {
+            byReason.push({ ResourceId: rid, Date: dk, Hours: eff, Reason: reason });
+        }
+    }
+    return { hours, byReason };
+}
 
 function writeTable(workbook: ExcelScript.Workbook, sheetName: string, rows: (string | number)[][]): void {
     safeDeleteSheet(workbook, sheetName);
@@ -1046,12 +747,7 @@ function writeTable(workbook: ExcelScript.Workbook, sheetName: string, rows: (st
     formatHeader(ws.getRangeByIndexes(0, 0, 1, rows[0].length));
     ws.getUsedRange()?.getFormat().autofitColumns();
 }
-
-function cleanupGanttSheets(
-    workbook: ExcelScript.Workbook,
-    baseName: string,
-    keepYears: Set<number>
-): void {
+function cleanupGanttSheets(workbook: ExcelScript.Workbook, baseName: string, keepYears: Set<number>): void {
     const pattern = new RegExp(`^${baseName}_(\\d{4})$`);
     const toDelete: string[] = [];
     const sheets = workbook.getWorksheets();
@@ -1062,70 +758,40 @@ function cleanupGanttSheets(
         const y = Number(m[1]);
         if (!keepYears.has(y)) toDelete.push(name);
     }
-    for (let i = 0; i < toDelete.length; i++) {
-        const ws = workbook.getWorksheet(toDelete[i]);
-        if (ws) ws.delete();
-    }
+    for (let i = 0; i < toDelete.length; i++) { const ws = workbook.getWorksheet(toDelete[i]); if (ws) ws.delete(); }
 }
-
-function writeProjectGantts(
-    workbook: ExcelScript.Workbook,
-    baseName: string,
-    projects: ProjectRow[],
-    proAlloc: ProAlloc[],
-    start: Date,
-    end: Date
-): void {
+function writeProjectGantts(workbook: ExcelScript.Workbook, baseName: string, projects: ProjectRow[], proAlloc: ProAlloc[], start: Date, end: Date): void {
     const firstYear = start.getFullYear();
     const lastYear = end.getFullYear();
-
-    if (lastYear - firstYear > 25) {
-        writeValidationErrors(workbook, [
-            `Gantt year span too large: ${firstYear}..${lastYear}. Check configuration dates.`
-        ]);
-        return;
-    }
-
-    const keepYears = new Set<number>();
-    for (let y = firstYear; y <= lastYear; y++) keepYears.add(y);
+    if (lastYear - firstYear > 25) { writeValidationErrors(workbook, [`Gantt year span too large: ${firstYear}..${lastYear}.`]); return; }
+    const keepYears = new Set<number>(); for (let y = firstYear; y <= lastYear; y++) keepYears.add(y);
     cleanupGanttSheets(workbook, baseName, keepYears);
-
-    const allocIndex: Dict<Dict<number>> = {} as Dict<Dict<number>>;
+    const allocIndex: Dict<Dict<number>> = {};
     for (let i = 0; i < proAlloc.length; i++) {
         const pa = proAlloc[i];
-        (allocIndex[pa.ProjectKey] ??= {} as Dict<number>)[pa.Date] =
-            ((allocIndex[pa.ProjectKey][pa.Date] ?? 0) + pa.Hours);
+        (allocIndex[pa.ProjectKey] ??= {})[pa.Date] = ((allocIndex[pa.ProjectKey][pa.Date] ?? 0) + pa.Hours);
     }
-
     for (let year = firstYear; year <= lastYear; year++) {
-        const sheetName = `${baseName}_${year}`;
-        safeDeleteSheet(workbook, sheetName);
+        const sheetName = `${baseName}_${year}`; safeDeleteSheet(workbook, sheetName);
         const ws = workbook.addWorksheet(sheetName);
-
         const yStart = (year === firstYear) ? new Date(start.getFullYear(), start.getMonth(), start.getDate()) : new Date(year, 0, 1);
         const yEnd = (year === lastYear) ? new Date(end.getFullYear(), end.getMonth(), end.getDate()) : new Date(year, 11, 31);
-
         const days = rangeDays(yStart, yEnd);
         if (days.length === 0) { ws.getRange("A1").setValue("No days in this year within forecast."); continue; }
-
-        const headers: string[] = ["ProjectKey", "ProjectId", "ProjectName", ...days.map((d: Date): string => mmdd(d)), "Total Allocated Hours (Year)"];
+        const headers: string[] = ["ProjectKey", "ProjectId", "ProjectName", ...days.map(d => mmdd(d)), "Total Allocated Hours (Year)"];
         const headerRange = ws.getRangeByIndexes(0, 0, 1, headers.length);
-        headerRange.setValues([headers]);
-        formatHeader(headerRange);
-
+        headerRange.setValues([headers]); formatHeader(headerRange);
         let row = 1;
         for (let ip = 0; ip < projects.length; ip++) {
             const p = projects[ip];
             if (p.end.getFullYear() < year || p.start.getFullYear() > year) continue;
-
             const line: (string | number)[] = [p.key, p.id, p.name];
             let yearSum = 0;
             for (let id = 0; id < days.length; id++) {
                 const d = days[id];
-                if (!isBetween(d, p.start, p.end)) { line.push(0); continue; }
+                if (!(d.getTime() >= p.start.getTime() && d.getTime() <= p.end.getTime())) { line.push(0); continue; }
                 const v = allocIndex[p.key]?.[fmtYMD(d)] ?? 0;
-                line.push(v);
-                yearSum += v;
+                line.push(v); yearSum += v;
             }
             line.push(yearSum);
             ws.getRangeByIndexes(row, 0, 1, line.length).setValues([line]);
@@ -1134,32 +800,14 @@ function writeProjectGantts(
         ws.getUsedRange()?.getFormat().autofitColumns();
     }
 }
-
-function writeResourceGantts(
-    workbook: ExcelScript.Workbook,
-    baseName: string,
-    resources: ResourceRow[],
-    resAlloc: ResAlloc[],
-    start: Date,
-    end: Date
-): void {
+function writeResourceGantts(workbook: ExcelScript.Workbook, baseName: string, resources: ResourceRow[], resAlloc: ResAlloc[], start: Date, end: Date): void {
     const firstYear = start.getFullYear();
     const lastYear = end.getFullYear();
-
-    if (lastYear - firstYear > 25) {
-        writeValidationErrors(workbook, [
-            `Gantt year span too large: ${firstYear}..${lastYear}. Check configuration dates.`
-        ]);
-        return;
-    }
-
-    const keepYears = new Set<number>();
-    for (let y = firstYear; y <= lastYear; y++) keepYears.add(y);
+    if (lastYear - firstYear > 25) { writeValidationErrors(workbook, [`Gantt year span too large: ${firstYear}..${lastYear}.`]); return; }
+    const keepYears = new Set<number>(); for (let y = firstYear; y <= lastYear; y++) keepYears.add(y);
     cleanupGanttSheets(workbook, baseName, keepYears);
-
-    const hoursIdx: Dict<number> = {} as Dict<number>;                // ResourceId|ProjectId|ProjectName|YYYY-MM-DD -> hours
-    const resCombos: Dict<Set<string>> = {} as Dict<Set<string>>;     // ResourceId -> set "ProjectId|ProjectName"
-
+    const hoursIdx: Dict<number> = {};                // ResourceId|ProjectId|ProjectName|YYYY-MM-DD -> hours
+    const resCombos: Dict<Set<string>> = {};         // ResourceId -> set "ProjectId|ProjectName"
     for (let i = 0; i < resAlloc.length; i++) {
         const ra = resAlloc[i];
         const dateKey = ra.Date;
@@ -1168,27 +816,20 @@ function writeResourceGantts(
         hoursIdx[hoursKey] = (hoursIdx[hoursKey] ?? 0) + ra.Hours;
         (resCombos[ra.ResourceId] ??= new Set<string>()).add(comboKey);
     }
-
     for (let year = firstYear; year <= lastYear; year++) {
-        const sheetName = `${baseName}_${year}`;
-        safeDeleteSheet(workbook, sheetName);
+        const sheetName = `${baseName}_${year}`; safeDeleteSheet(workbook, sheetName);
         const ws = workbook.addWorksheet(sheetName);
-
         const yStart = (year === firstYear) ? new Date(start.getFullYear(), start.getMonth(), start.getDate()) : new Date(year, 0, 1);
         const yEnd = (year === lastYear) ? new Date(end.getFullYear(), end.getMonth(), end.getDate()) : new Date(year, 11, 31);
         const days = rangeDays(yStart, yEnd);
         if (days.length === 0) { ws.getRange("A1").setValue("No days in this year within forecast."); continue; }
-
-        const headers: string[] = ["ResourceId", "ResourceName", "ProjectId", "ProjectName", ...days.map((d: Date): string => mmdd(d)), "Total Allocated Hours (Year)"];
+        const headers: string[] = ["ResourceId", "ResourceName", "ProjectId", "ProjectName", ...days.map(d => mmdd(d)), "Total Allocated Hours (Year)"];
         const headerRange = ws.getRangeByIndexes(0, 0, 1, headers.length);
-        headerRange.setValues([headers]);
-        formatHeader(headerRange);
-
+        headerRange.setValues([headers]); formatHeader(headerRange);
         let row = 1;
         for (let ir = 0; ir < resources.length; ir++) {
             const r = resources[ir];
             if (r.end.getFullYear() < year || r.start.getFullYear() > year) continue;
-
             const combos = Array.from(resCombos[r.id] ?? new Set<string>());
             for (let ic = 0; ic < combos.length; ic++) {
                 const split = combos[ic].split("|");
@@ -1200,8 +841,7 @@ function writeResourceGantts(
                     const dk = fmtYMD(days[id]);
                     const key = `${r.id}|${pid}|${pname}|${dk}`;
                     const v = hoursIdx[key] ?? 0;
-                    line.push(v);
-                    total += v;
+                    line.push(v); total += v;
                 }
                 line.push(total);
                 ws.getRangeByIndexes(row, 0, 1, line.length).setValues([line]);
@@ -1211,17 +851,8 @@ function writeResourceGantts(
         ws.getUsedRange()?.getFormat().autofitColumns();
     }
 }
-
 /** Projects in rows; columns are Year / Month / Resource (3 header rows) + GRAND TOTAL row. */
-function writeProjectMonthResourceGantt(
-    workbook: ExcelScript.Workbook,
-    sheetName: string,
-    projects: ProjectRow[],
-    resources: ResourceRow[],
-    resAlloc: ResAlloc[],
-    start: Date,
-    end: Date
-): void {
+function writeProjectMonthResourceGantt(workbook: ExcelScript.Workbook, sheetName: string, projects: ProjectRow[], resources: ResourceRow[], resAlloc: ResAlloc[], start: Date, end: Date): void {
     safeDeleteSheet(workbook, sheetName);
     const ws = workbook.addWorksheet(sheetName);
 
@@ -1234,7 +865,7 @@ function writeProjectMonthResourceGantt(
     })();
 
     // Index allocations by (ProjectKey, Month, ResourceId)
-    const idx: Dict<number> = {} as Dict<number>; // key = ProjectKey|YYYY-MM|ResourceId
+    const idx: Dict<number> = {}; // key = ProjectKey|YYYY-MM|ResourceId
     for (let i = 0; i < resAlloc.length; i++) {
         const ra = resAlloc[i];
         const mk = ra.Date.substring(0, 7); // YYYY-MM
@@ -1243,8 +874,7 @@ function writeProjectMonthResourceGantt(
     }
 
     const resIds = resources.map((r: ResourceRow): string => r.id);
-    const resNamesById: Dict<string> = {} as Dict<string>;
-    resources.forEach((r: ResourceRow): void => { resNamesById[r.id] = r.name; });
+    const resNamesById: Dict<string> = {}; resources.forEach((r: ResourceRow): void => { resNamesById[r.id] = r.name; });
 
     const fixedCols = ["ProjectKey", "ProjectId", "ProjectName"];
     const headerRow1: string[] = [...fixedCols];
@@ -1307,41 +937,513 @@ function writeProjectMonthResourceGantt(
     ws.getUsedRange()?.getFormat().autofitColumns();
 }
 
-function ensureSheet(workbook: ExcelScript.Workbook, name: string, clear = false): ExcelScript.Worksheet {
-    let ws = workbook.getWorksheet(name);
-    if (!ws) ws = workbook.addWorksheet(name);
-    if (clear) ws.getUsedRange()?.clear(ExcelScript.ClearApplyTo.all);
-    return ws;
-}
-function safeDeleteSheet(workbook: ExcelScript.Workbook, name: string): void {
-    const ws = workbook.getWorksheet(name);
-    if (ws) ws.delete();
-}
-function formatHeader(r: ExcelScript.Range): void {
-    const fmt = r.getFormat();
-    fmt.getFill().setColor("#D9E1F2");
-    fmt.getFont().setBold(true);
-}
-
 /////////////////////// Summary ///////////////////////
 
 function buildProjectSummary(projects: ProjectRow[], resAlloc: ResAlloc[]): (string | number)[][] {
-    const utilByProject: Dict<number> = {} as Dict<number>;
-    resAlloc.forEach((ra: ResAlloc): void => {
-        utilByProject[ra.ProjectKey] = (utilByProject[ra.ProjectKey] ?? 0) + ra.Hours;
-    });
+    const utilByProject: Dict<number> = {};
+    resAlloc.forEach(ra => { utilByProject[ra.ProjectKey] = (utilByProject[ra.ProjectKey] ?? 0) + ra.Hours; });
 
     const out: (string | number)[][] = [];
-    projects.forEach((p: ProjectRow): void => {
+    projects.forEach(p => {
         const allocated = utilByProject[p.key] ?? 0;
         const remainingAtStart = p.remaining;
         const unallocated = Math.max(0, remainingAtStart - allocated);
-
-        out.push([
-            p.key, p.id, p.name, p.desc, p.pm,
-            fmtYMD(p.start), fmtYMD(p.end), p.status,
-            remainingAtStart, allocated, unallocated
-        ]);
+        out.push([p.key, p.id, p.name, p.desc, p.pm, fmtYMD(p.start), fmtYMD(p.end), p.status, remainingAtStart, allocated, unallocated]);
     });
     return out;
+}
+/////////////////////// PSP + Borrowing + Outputs (incl. Reason pseudo-projects) ///////////////////////
+function continueAfterMain(
+    workbook: ExcelScript.Workbook,
+    config: Config,
+    projects: ProjectRow[],
+    resources: ResourceRow[],
+    daysAll: Date[],
+    perDayAvail: Dict<Dict<number>>,
+    dailySoftCap: Dict<Dict<number>>,
+    projectPools: Dict<ProjectRemaining>,
+    monthAlloc: Dict<Dict<number>>,
+    weekAlloc: Dict<Dict<number>>,
+    resAlloc: ResAlloc[],
+    proAlloc: ProAlloc[],
+    assignedPerDay: Dict<Dict<number>>,
+    projDayAssigned: Dict<Dict<number>>,
+    unavailReasonEvents: UnavailReasonEvent[] // NEW: raw unavailability reason rows
+): void {
+
+    // ---------- local helpers (no duplicates) ----------
+    const QUANT = QUANTUM;
+    const EPSL = EPS;
+
+    const fmtYMD = (d: Date): string =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const monthKey = (d: Date): string =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const weekKey = (d: Date): string => {
+        const tmp = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+        const day = (tmp.getUTCDay() + 6) % 7;
+        tmp.setUTCDate(tmp.getUTCDate() - day + 3);
+        const wk1 = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 4));
+        const week = 1 + Math.round(((tmp.getTime() - wk1.getTime()) / 86400000 - 3) / 7);
+        return `${tmp.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+    };
+    const firstOfMonth = (d: Date): Date => new Date(d.getFullYear(), d.getMonth(), 1);
+    const lastOfMonth = (d: Date): Date => new Date(d.getFullYear(), d.getMonth() + 1, 0);
+    const isBetween = (d: Date, start: Date, end: Date): boolean =>
+        d.getTime() >= start.getTime() && d.getTime() <= end.getTime();
+    const rangeDays = (start: Date, end: Date): Date[] => {
+        const out: Date[] = [];
+        const cur = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+        while (cur.getTime() <= end.getTime()) { out.push(new Date(cur)); cur.setDate(cur.getDate() + 1); }
+        return out;
+    };
+    const monthsBetween = (aStart: Date, aEnd: Date): Date[] => {
+        const out: Date[] = [];
+        let m = new Date(aStart.getFullYear(), aStart.getMonth(), 1);
+        const e = new Date(aEnd.getFullYear(), aEnd.getMonth(), 1);
+        while (m.getTime() <= e.getTime()) { out.push(new Date(m)); m = new Date(m.getFullYear(), m.getMonth() + 1, 1); }
+        return out;
+    };
+    const monthsOverlap = (mStart: Date, pStart: Date, pEnd: Date): boolean => {
+        const mEnd = lastOfMonth(mStart);
+        return !(mEnd.getTime() < pStart.getTime() || mStart.getTime() > pEnd.getTime());
+    };
+
+    const getAssignedMap = (dk: string): Dict<number> => {
+        if (!assignedPerDay[dk]) assignedPerDay[dk] = {};
+        return assignedPerDay[dk];
+    };
+
+    const pushAlloc = (p: ProjectRow, r: ResourceRow, d: Date, grant: number, note: string): void => {
+        const dk = fmtYMD(d), mk = monthKey(d), wk = weekKey(d);
+        const map = getAssignedMap(dk);
+        map[r.id] = (map[r.id] ?? 0) + grant;
+        projDayAssigned[p.key][dk] = (projDayAssigned[p.key][dk] ?? 0) + grant;
+
+        resAlloc.push({ ResourceId: r.id, ResourceName: r.name, ProjectKey: p.key, ProjectId: p.id, ProjectName: p.name, Date: dk, Hours: grant, Notes: note });
+        proAlloc.push({ ProjectKey: p.key, ProjectId: p.id, ProjectName: p.name, ProjectManager: p.pm, Date: dk, Hours: grant, Notes: note });
+
+        monthAlloc[p.key][mk] = (monthAlloc[p.key][mk] ?? 0) + grant;
+        weekAlloc[p.key][wk] = (weekAlloc[p.key][wk] ?? 0) + grant;
+    };
+
+    const assignHours = (
+        p: ProjectRow,
+        r: ResourceRow,
+        d: Date,
+        hoursRequested: number,
+        note: string,
+        ignoreSoftCap?: boolean
+    ): number => {
+        if (hoursRequested <= 0) return 0;
+
+        // EDNS safeguard for Standard borrowing too
+        if (p.assignType === "Exclusive-DoNotShare" && r.id !== p.primaryId) return 0;
+
+        const dk = fmtYMD(d), mk = monthKey(d);
+
+        // room on resource-day
+        const dayCap = (perDayAvail[dk]?.[r.id] ?? 0);
+        const already = getAssignedMap(dk)[r.id] ?? 0;
+        let room = Math.max(0, dayCap - already);
+        if (room < QUANT) return 0;
+
+        // optional per-day soft cap for the project
+        if (!ignoreSoftCap) {
+            const cap = dailySoftCap[p.key]?.[dk];
+            if (cap !== undefined) {
+                const used = projDayAssigned[p.key][dk] ?? 0;
+                const leftCap = Math.max(0, cap - used);
+                if (leftCap < QUANT) return 0;
+                room = Math.min(room, leftCap);
+            }
+        }
+
+        // pool remaining
+        const pools = projectPools[p.key];
+        const poolRemain = (p.distMethod === "Recurring Monthly") ? (pools.monthlyRemaining[mk] ?? 0) : pools.totalRemaining;
+        if (poolRemain < QUANT) return 0;
+
+        let grant = Math.min(hoursRequested, room, poolRemain);
+        grant = Math.floor(grant / QUANT) * QUANT;
+        if (grant < QUANT) return 0;
+
+        if (p.distMethod === "Recurring Monthly") projectPools[p.key].monthlyRemaining[mk] = (pools.monthlyRemaining[mk] ?? 0) - grant;
+        else projectPools[p.key].totalRemaining = pools.totalRemaining - grant;
+
+        pushAlloc(p, r, d, grant, note);
+        return grant;
+    };
+
+    // ---- RM usability checks (for gating) ----
+    const hasWorkableDay_EDNS = (p: ProjectRow, mStart: Date): boolean => {
+        const primary = resources.find(r => r.id === p.primaryId) || null;
+        if (!primary) return false;
+        const days = rangeDays(firstOfMonth(mStart), lastOfMonth(mStart));
+        for (let i = 0; i < days.length; i++) {
+            const d = days[i];
+            if (!isBetween(d, p.start, p.end) || !isBetween(d, primary.start, primary.end)) continue;
+            const dk = fmtYMD(d);
+            const room = Math.max(0, (perDayAvail[dk]?.[primary.id] ?? 0) - (getAssignedMap(dk)[primary.id] ?? 0));
+            if (room >= QUANT) return true;
+        }
+        return false;
+    };
+    const hasWorkableDay_ES1 = (p: ProjectRow, mStart: Date): boolean => {
+        if (hasWorkableDay_EDNS(p, mStart)) return true; // primary workable
+        const days = rangeDays(firstOfMonth(mStart), lastOfMonth(mStart));
+        for (let idy = 0; idy < days.length; idy++) {
+            const d = days[idy];
+            if (!isBetween(d, p.start, p.end)) continue;
+            const dk = fmtYMD(d);
+            for (let ir = 0; ir < resources.length; ir++) {
+                const r = resources[ir];
+                if (!isBetween(d, r.start, r.end)) continue;
+                const room = Math.max(0, (perDayAvail[dk]?.[r.id] ?? 0) - (getAssignedMap(dk)[r.id] ?? 0));
+                if (room >= QUANT) return true;
+            }
+        }
+        return false;
+    };
+
+    const hasRmPoolsLeftThisMonth = (mk: string): boolean => {
+        const [yy, mm] = mk.split("-").map(s => Number(s));
+        const mStart = new Date(yy, mm - 1, 1);
+
+        for (let ip = 0; ip < projects.length; ip++) {
+            const p = projects[ip];
+            if (p.distMethod !== "Recurring Monthly") continue;
+            if (p.assignType !== "Exclusive-DoNotShare" && p.assignType !== "Exclusive-ShareOne") continue;
+            if (!monthsOverlap(mStart, p.start, p.end)) continue;
+
+            const left = projectPools[p.key].monthlyRemaining[mk] ?? 0;
+            if (left < QUANT) continue;
+
+            const usable =
+                (p.assignType === "Exclusive-DoNotShare")
+                    ? hasWorkableDay_EDNS(p, mStart)
+                    : hasWorkableDay_ES1(p, mStart);
+
+            if (usable) return true;
+        }
+        return false;
+    };
+
+    // -------------------------------------------------------------------
+    // PSP MONTHLY MAX-OUT (unchanged core)
+    // -------------------------------------------------------------------
+
+    const monthsSeq = monthsBetween(config.forecastStart!, config.forecastEnd!);
+
+    // project filters
+    const isStd = (p: ProjectRow): boolean => p.distMethod === "Standard";
+    const isPSP = (p: ProjectRow): boolean => isStd(p) && p.assignType === "Primary-ShareProportion";
+    const isStdNonEDNS = (p: ProjectRow): boolean => isStd(p) && p.assignType !== "Exclusive-DoNotShare";
+
+    // urgency score for ordering (EOL then remaining)
+    const urgencyScore = (p: ProjectRow, d: Date): number => {
+        const remDays = Math.max(0, Math.floor((p.end.getTime() - d.getTime()) / 86400000));
+        const window = config.eolWindowDays ?? 21;
+        const maxBoost = config.eolMaxBoost ?? 3;
+        const eol = (remDays > window) ? 1 : (1 + (maxBoost - 1) * (window - remDays) / Math.max(1, window));
+        const left = projectPools[p.key].totalRemaining;
+        return eol * 100000 + left; // coarse tie-breaker by left
+    };
+
+    monthsSeq.forEach((mStart): void => {
+        const mk = monthKey(mStart);
+        if (hasRmPoolsLeftThisMonth(mk)) return; // wait until RM fully consumed OR unusable
+
+        const mEnd = lastOfMonth(mStart);
+        const days = rangeDays(mStart, mEnd);
+
+        for (let idy = 0; idy < days.length; idy++) {
+            const d = days[idy];
+            // Build candidate sets for THIS day only once
+            const pspToday = projects.filter(p =>
+                isPSP(p) && isBetween(d, p.start, p.end) && (projectPools[p.key].totalRemaining >= QUANT)
+            );
+            const otherStdToday = projects.filter(p =>
+                isStdNonEDNS(p) && isBetween(d, p.start, p.end) && (projectPools[p.key].totalRemaining >= QUANT)
+            );
+
+            // sort by urgency (EOL), then remaining
+            const sortByUrgencyAndLeft = (a: ProjectRow, b: ProjectRow): number => {
+                const ua = urgencyScore(a, d), ub = urgencyScore(b, d);
+                return (ub === ua) ? ((projectPools[b.key].totalRemaining - projectPools[a.key].totalRemaining) || 0) : (ub - ua);
+            };
+
+            let pspCands = pspToday.slice().sort((a, b) => sortByUrgencyAndLeft(a, b));
+            let otherCands = otherStdToday.slice().sort((a, b) => sortByUrgencyAndLeft(a, b));
+
+            // Per-resource greedy fill for the day
+            for (let ir = 0; ir < resources.length; ir++) {
+                const r = resources[ir];
+                if (!isBetween(d, r.start, r.end)) continue;
+
+                const dk = fmtYMD(d);
+                let room = Math.max(0, (perDayAvail[dk]?.[r.id] ?? 0) - (getAssignedMap(dk)[r.id] ?? 0));
+                room = Math.floor(room / QUANT) * QUANT;
+                if (room < QUANT) continue;
+
+                // 1) PSP first (ignore soft caps)
+                let iPSP = 0;
+                while (room >= QUANT && pspCands.length > 0) {
+                    const p = pspCands[iPSP % pspCands.length];
+
+                    const given = assignHours(p, r, d, QUANT, "PSP Monthly Max-Out", /*ignoreSoftCap*/ true);
+                    if (given >= QUANT - EPSL) room = Math.floor((room - given) / QUANT) * QUANT;
+
+                    // drop exhausted
+                    pspCands = pspCands.filter(pp => projectPools[pp.key].totalRemaining >= QUANT);
+                    iPSP++;
+                }
+                if (room < QUANT) continue;
+
+                // 2) Other Standard (non-EDNS) as secondary fill (ignore soft caps)
+                let iO = 0;
+                while (room >= QUANT && otherCands.length > 0) {
+                    const p = otherCands[iO % otherCands.length];
+
+                    const given = assignHours(p, r, d, QUANT, "STD Monthly Max-Out", /*ignoreSoftCap*/ true);
+                    if (given >= QUANT - EPSL) room = Math.floor((room - given) / QUANT) * QUANT;
+
+                    otherCands = otherCands.filter(pp => projectPools[pp.key].totalRemaining >= QUANT);
+                    iO++;
+                }
+            }
+        }
+    });
+
+    // ---------------- Daily Borrowing (Standard only) as final safety net ----------------
+
+    type Cand = { p: ProjectRow; left: number; prioKey: [number, number, number, number] };
+
+    const needsMonthlyFloor = (p: ProjectRow, d: Date): boolean => {
+        const mk = monthKey(d), got = (monthAlloc[p.key][mk] ?? 0);
+        const left = projectPools[p.key].totalRemaining;
+        return got + EPSL < (config.minMonthlyShare ?? QUANT) && left >= QUANT;
+    };
+    const needsWeeklyNudge = (p: ProjectRow, d: Date): boolean => {
+        const wk = weekKey(d), got = (weekAlloc[p.key][wk] ?? 0);
+        const minW = (config.minWeeklyShare ?? QUANT);
+        return (minW > 0) && got + EPSL < minW && (projectPools[p.key].totalRemaining >= QUANT);
+    };
+    const eolBoostStd = (p: ProjectRow, d: Date): number => {
+        const rem = Math.floor((p.end.getTime() - d.getTime()) / 86400000);
+        const W = config.eolWindowDays ?? 21;
+        const MAX = config.eolMaxBoost ?? 3;
+        if (rem > W) return 1;
+        const frac = Math.max(0, (W - Math.max(0, rem)) / Math.max(1, W));
+        return 1 + (MAX - 1) * frac;
+    };
+
+    for (let di = 0; di < daysAll.length; di++) {
+        const d = daysAll[di];
+        const dk = fmtYMD(d);
+
+        const needy = resources
+            .filter(r => isBetween(d, r.start, r.end))
+            .map(r => {
+                const cap = perDayAvail[dk]?.[r.id] ?? 0;
+                const got = getAssignedMap(dk)[r.id] ?? 0;
+                return { r, room: Math.max(0, cap - got) };
+            })
+            .filter(x => x.room >= QUANT)
+            .sort((a, b) => b.room - a.room);
+
+        if (needy.length === 0) continue;
+
+        const baseCandidates: Cand[] = projects
+            .filter(p => p.distMethod === "Standard" && isBetween(d, p.start, p.end))
+            .map((p): Cand => {
+                const left = projectPools[p.key].totalRemaining;
+                const needMonth = needsMonthlyFloor(p, d) ? 1 : 0;
+                const needWeek = needsWeeklyNudge(p, d) ? 1 : 0;
+                const boost = eolBoostStd(p, d);
+                return { p, left, prioKey: [needMonth, needWeek, boost, left] };
+            })
+            .filter(c => c.left >= QUANT);
+
+        for (let ni = 0; ni < needy.length; ni++) {
+            const need = needy[ni];
+            if (need.room < QUANT) continue;
+
+            const sorted = (list: Cand[]): Cand[] =>
+                list
+                    .filter(c => c.p.assignType !== "Exclusive-DoNotShare" && c.left >= QUANT)
+                    .sort((a, b) => {
+                        for (let i = 0; i < 4; i++) { if (b.prioKey[i] !== a.prioKey[i]) return b.prioKey[i] - a.prioKey[i]; }
+                        return 0;
+                    })
+                    .map(c => ({ p: c.p, left: c.left, prioKey: c.prioKey }));
+
+            // Round-robin Standard
+            let stdCandidates = sorted(baseCandidates);
+            let rrRounds = 0;
+            const MAX_RR_ROUNDS = 96;
+            while (need.room >= QUANT - EPSL && stdCandidates.length > 0 && rrRounds < MAX_RR_ROUNDS) {
+                rrRounds++;
+                let anyGivenRR = false;
+                for (let ci = 0; ci < stdCandidates.length; ci++) {
+                    if (need.room < QUANT - EPSL) break;
+                    const cand = stdCandidates[ci];
+                    if (cand.left < QUANT) continue;
+
+                    const parts: string[] = [];
+                    if (cand.prioKey[0]) parts.push("Monthly-share");
+                    if (cand.prioKey[1]) parts.push("Weekly-nudge");
+                    if (cand.prioKey[2] > 1) parts.push("EOL-priority");
+                    const note = ["Borrowing / RR-Standard", ...parts].join(" / ");
+
+                    const given = assignHours(cand.p, need.r, d, QUANT, note);
+                    if (given >= QUANT - EPSL) {
+                        cand.left -= given;
+                        need.room -= given;
+                        anyGivenRR = true;
+                    }
+                }
+                stdCandidates = stdCandidates.filter(c => c.left >= QUANT);
+                if (!anyGivenRR) break;
+            }
+
+            if (need.room < QUANT - EPSL) continue;
+
+            // Fallback spread
+            let candidates = sorted(baseCandidates);
+            if (candidates.length === 0) continue;
+
+            const MAX_ROUNDS = 32;
+            let rounds = 0;
+            while (need.room >= QUANT - EPSL && candidates.length > 0 && rounds < MAX_ROUNDS) {
+                rounds++;
+                const rawShare = need.room / candidates.length;
+                const perShare = Math.max(QUANT, Math.floor(rawShare / QUANT) * QUANT);
+                let anyGiven = false;
+
+                for (let ci = 0; ci < candidates.length; ci++) {
+                    if (need.room < QUANT - EPSL) break;
+                    const cand = candidates[ci];
+
+                    const parts: string[] = [];
+                    if (cand.prioKey[0]) parts.push("Monthly-share");
+                    if (cand.prioKey[1]) parts.push("Weekly-nudge");
+                    if (cand.prioKey[2] > 1) parts.push("EOL-priority");
+                    const note = ["Borrowing", ...parts].join(" / ");
+
+                    const ask = Math.floor(Math.min(perShare, cand.left, need.room) / QUANT) * QUANT;
+                    if (ask < QUANT) continue;
+
+                    const given = assignHours(cand.p, need.r, d, ask, note);
+                    if (given >= QUANT - EPSL) {
+                        cand.left -= given;
+                        need.room -= given;
+                        anyGiven = true;
+                    }
+                }
+                candidates = candidates.filter(c => c.left >= QUANT);
+
+                if (!anyGiven) {
+                    for (let ci = 0; ci < candidates.length; ci++) {
+                        if (need.room < QUANT - EPSL) break;
+                        const cand = candidates[ci];
+                        const given = assignHours(cand.p, need.r, d, QUANT, "Borrowing / quantum");
+                        if (given >= QUANT - EPSL) { cand.left -= given; need.room -= given; anyGiven = true; }
+                    }
+                    candidates = candidates.filter(c => c.left >= QUANT);
+                }
+                if (!anyGiven) break;
+            }
+        }
+    }
+
+    // ---------------- NEW: Append Reason-based pseudo-projects to outputs ----------------
+
+    // 1) Build unique reasons and create pseudo-project rows (do NOT affect scheduling/pools)
+    const reasonSet = new Set<string>();
+    for (let i = 0; i < unavailReasonEvents.length; i++) {
+        const r = unavailReasonEvents[i];
+        if (r.Hours > 0) reasonSet.add(r.Reason && r.Reason.trim() ? r.Reason.trim() : "Unavailable");
+    }
+
+    const reasonProjects: Dict<ProjectRow> = {};
+    const reasonToKey = (reason: string): string => {
+        // key/id safe-ish but readable; keys do not need Excel sheet safety (columns), just uniqueness
+        const trimmed = reason.slice(0, 60);
+        return `UA:${trimmed}`;
+    };
+
+    // All pseudo-projects share forecast window, zero remaining, Standard, Active
+    const fStart = config.forecastStart!;
+    const fEnd = config.forecastEnd!;
+    reasonSet.forEach((reason) => {
+        const key = reasonToKey(reason);
+        reasonProjects[reason] = {
+            key, id: key, name: reason,
+            pm: "System", desc: "Unavailability",
+            total: 0, prevUsed: 0, remaining: 0,
+            start: fStart, end: fEnd, status: "Active",
+            distMethod: "Standard", primaryId: "", primaryName: "", assignType: "Primary-ShareProportion"
+        };
+    });
+
+    // 2) Convert reason events into allocation rows (use actual resource names where available)
+    for (let i = 0; i < unavailReasonEvents.length; i++) {
+        const e = unavailReasonEvents[i];
+        const hours = Math.max(0, e.Hours);
+        if (hours <= 0) continue;
+
+        const reason = e.Reason && e.Reason.trim() ? e.Reason.trim() : "Unavailable";
+        const proj = reasonProjects[reason]; if (!proj) continue;
+
+        const rname = (resourcesById[e.ResourceId]?.name ?? e.ResourceId);
+        const note = `Unavailability: ${reason}`;
+
+        // Push allocation entries (these do not affect scheduling since done post-run)
+        resAlloc.push({
+            ResourceId: e.ResourceId, ResourceName: rname,
+            ProjectKey: proj.key, ProjectId: proj.id, ProjectName: proj.name,
+            Date: e.Date, Hours: hours, Notes: note
+        });
+        proAlloc.push({
+            ProjectKey: proj.key, ProjectId: proj.id, ProjectName: proj.name,
+            ProjectManager: proj.pm, Date: e.Date, Hours: hours, Notes: note
+        });
+    }
+
+    // 3) Extend the project list ONLY for outputs
+    const projectsForOutput: ProjectRow[] = projects.concat(Object.values(reasonProjects));
+
+    // ---------------- Outputs (ProjectMonthResource first) ----------------
+
+    const summary = buildProjectSummary(projectsForOutput, resAlloc);
+
+    // Keep "ProjectMonthResource" as the FIRST output sheet
+    writeProjectMonthResourceGantt(
+        workbook,
+        "ProjectMonthResource",
+        projectsForOutput,
+        resources,
+        resAlloc,
+        config.forecastStart!,
+        config.forecastEnd!
+    );
+
+    writeTable(workbook, "ResourceAllocation", [
+        ["ResourceId", "ResourceName", "ProjectKey", "ProjectId", "ProjectName", "Date", "Hours", "Notes"],
+        ...resAlloc.map(r => [r.ResourceId, r.ResourceName, r.ProjectKey, r.ProjectId, r.ProjectName, r.Date, r.Hours, r.Notes])
+    ]);
+
+    writeTable(workbook, "ProjectAllocation", [
+        ["ProjectKey", "ProjectId", "ProjectName", "ProjectManager", "Date", "Hours", "Notes"],
+        ...proAlloc.map(p => [p.ProjectKey, p.ProjectId, p.ProjectName, p.ProjectManager, p.Date, p.Hours, p.Notes])
+    ]);
+
+    writeTable(workbook, "ProjectSummary", [
+        ["ProjectKey", "ProjectId", "ProjectName", "Description", "Project Manager", "StartDate", "EndDate", "Status", "Remaining_Hours_At_Start", "Allocated_Hours", "Unallocated_Hours"],
+        ...summary
+    ]);
+
+    writeProjectGantts(workbook, "ProjectGantt", projectsForOutput, proAlloc, config.forecastStart!, config.forecastEnd!);
+    writeResourceGantts(workbook, "ResourceGantt", resources, resAlloc, config.forecastStart!, config.forecastEnd!);
 }

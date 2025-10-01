@@ -1,10 +1,43 @@
-Projects
-  ProjectKey	ProjectId	ProjectName	Description	Project Manager	TotalHours	PreviouslyUsedHours	RemainingHours	StartDate	EndDate	Status	Distribution Method	PrimaryResourceId	PrimaryResourceName	PrimaryResourceAssignmentType
-
-Resources
-
-  ResourceId	ResourceName	Role	StartDate	EndDate	Status
-
-ResourceAvailability
-
-  ResourceId	Date	UnavailableHours	Reason
+Projects	
+	ProjectKey
+	ProjectId
+	ProjectName
+	Description
+	Project Manager
+	TotalHours
+	PreviouslyUsedHours
+	RemainingHours
+	StartDate
+	EndDate
+	Status
+	Distribution Method
+	PrimaryResourceId
+	PrimaryResourceName
+	PrimaryResourceAssignmentType
+	
+Resources	
+	ResourceId
+	ResourceName
+	Role
+	StartDate
+	EndDate
+	Status
+	
+ResourceAvailabilty	
+	ResourceId
+	Date
+	UnavailableHours
+	Reason
+	
+Configurations	
+	ConfigId
+	Name
+	Value
+	Status
+	Description
+	
+Calendar	
+	Date
+	Year
+	Month
+	AvailableHours
